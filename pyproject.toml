@@ -1,0 +1,23 @@
+[project]
+name = "yaros-speech-gateway"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.4",
+    "websockets>=17.0.1",
+    "torch>=2.4",
+    "transformers>=4.44",
+    "numpy>=1.26",
+]
+
+# Target server (per ТЗ) has no GPU — pull the CPU-only torch build instead
+# of PyPI's default CUDA wheel, which drags in several GB of unused
+# nvidia-* packages.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

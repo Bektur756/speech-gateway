@@ -1,0 +1,47 @@
+services:
+  vosk-ru:
+    image: alphacep/kaldi-ru:latest
+    restart: unless-stopped
+    # built-in full-size Russian model, no volume needed
+
+  vosk-ky:
+    # No dedicated alphacep/kaldi-ky image exists — reuse the kaldi-en
+    # server binary and override its model path with the downloaded
+    # Kyrgyz model (works "even for a different language" per alphacep docs).
+    image: alphacep/kaldi-en:latest
+    restart: unless-stopped
+    volumes:
+      - ./models/vosk-model-ky-0.42:/opt/vosk-model-en/model
+
+  gateway:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - vosk-ru
+      - vosk-ky
+    environment:
+      AIRUN_API_KEY: ${AIRUN_API_KEY}
+      VOSK_RU_URL: ws://vosk-ru:2700
+      VOSK_KY_URL: ws://vosk-ky:2700
+      AUDIOSOCKET_PORT_RU: "9098"
+      AUDIOSOCKET_PORT_KY: "9099"
+      WHISPER_MODEL_PATH: /models/kyrgyz-whisper-small
+    ports:
+      - "9098:9098"   # AudioSocket — ru queue, Asterisk dialplan points here
+      - "9099:9099"   # AudioSocket — ky queue
+    volumes:
+      - ./data/transcripts:/data/transcripts
+      # Both sizes mounted so WHISPER_MODEL_PATH can be flipped to compare
+      # small vs medium without rebuilding the image.
+      - ./models/kyrgyz-whisper-small:/models/kyrgyz-whisper-small:ro
+      - ./models/kyrgyz-whisper-medium:/models/kyrgyz-whisper-medium:ro
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    ports:
+      - "80:80"       # WS API /calls/{id}/stream for external consumers
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro

@@ -1,0 +1,15 @@
+# Ignore all dotfiles/dot-directories by default (local tooling, editor
+# config, secrets, etc.), then explicitly un-ignore the ones meant to be
+# tracked.
+.*
+!.gitignore
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Large local assets — fetched separately, not tracked (see README/TZ)
+models/
+data/
