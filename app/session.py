@@ -13,12 +13,23 @@ fed the same resampled audio:
     event just stops that track; it never affects the primary transcript.
 
 Phrase assembly: forwards "final" events downstream (tagged with the
-producing engine, persisted to a per-call JSONL file) and live "partial"
-events for real-time display. Consecutive repeats of the same partial or
-final text within a track are deduped so downstream only sees changes;
-switching to a fallback engine starts a fresh segment. Dedup state is
-per-track, so two engines transcribing the same audio never dedupe against
-each other.
+producing engine) and live "partial" events for real-time display.
+Consecutive repeats of the same partial or final text within a track are
+deduped so downstream only sees changes; switching to a fallback engine
+starts a fresh segment. Dedup state is per-track, so two engines
+transcribing the same audio never dedupe against each other.
+
+Persistence: a single-leg call (no role) persists to its own per-call
+data/transcripts/{call_id}.jsonl, its only record. A role-tagged (dual-leg)
+call skips that file entirely — its "final" records already land in the
+per-engine conversation files that main.py's broadcast() writes
+(data/transcripts/conversations/{conversation_id}-{engine}.jsonl), so a
+separate per-call copy would just be redundant.
+
+Role-tagged (dual-leg) calls also get their 16kHz audio recorded to
+data/recordings/{call_id}.wav as it arrives, so main.py can run an offline
+Whisper pass over it after the call ends (see adapters.transcribe_recording)
+without needing to keep up with the call live.
 """
 import asyncio
 import audioop
@@ -26,6 +37,7 @@ import json
 import logging
 import os
 import time
+import wave
 from pathlib import Path
 
 from .adapters import build_adapter
@@ -35,21 +47,38 @@ log = logging.getLogger("session")
 TRANSCRIPT_DIR = Path("/data/transcripts")
 TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Recordings are only made for role-tagged (dual-leg) calls — that's the
+# only context where a downstream offline pass (e.g. Whisper comparison,
+# see main.py) has any use for the audio; single-leg ru/ky calls don't get
+# one, to avoid the disk cost for no benefit.
+RECORDINGS_DIR = Path("/data/recordings")
+RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+
 # language -> ordered list of (engine_name, engine_lang); first is primary,
 # rest are fallbacks tried in order if the previous one goes "fatal".
 ROUTING = {
     "ru": [("vosk", "ru")],
-    "ky": [("airun", "ky"), ("vosk", "ky")],
+    "ky": [("airun", "ky")],
 }
 
-# language -> engines that run alongside the primary chain for the whole
-# call, for quality comparison. Real RTF on this deployment's CPU has not
-# been measured (ТЗ item 3) — running Whisper on every live call adds real
-# CPU load on top of the primary engine. Kill switch: PARALLEL_STT_ENABLED.
+# language -> engines that run alongside the primary for the whole call.
+# Vosk always runs in parallel for ky — both real-time capable (no RTF
+# concern), so their "final" transcripts land side by side in the same
+# JSONL (tagged by "engine") for direct comparison, and the call still gets
+# full Vosk coverage even if AiRUN fails outright (no fallback needed —
+# Vosk was never depending on that happening).
 PARALLEL_ENGINES = {
-    "ru": [("whisper", "ru")],
-    "ky": [("whisper", "ky")],
-} if os.environ.get("PARALLEL_STT_ENABLED", "true").lower() not in ("0", "false", "no") else {}
+    "ky": [("vosk", "ky")],
+}
+
+# Whisper comparison track — separately gated, off by default. Measured
+# RTF=3.06 on this CPU-only box (24s to transcribe one 8s window) means it
+# falls permanently behind live audio, so its "final" only reflects
+# whatever's left in its rolling buffer when the call ends, not the whole
+# conversation — not comparable to Vosk/AiRUN's full-coverage output.
+if os.environ.get("PARALLEL_STT_ENABLED", "false").lower() not in ("0", "false", "no"):
+    PARALLEL_ENGINES.setdefault("ru", []).append(("whisper", "ru"))
+    PARALLEL_ENGINES.setdefault("ky", []).append(("whisper", "ky"))
 
 
 def _normalize(text: str) -> str:
@@ -146,15 +175,27 @@ class _EngineTrack:
 
 
 class CallSession:
-    def __init__(self, call_id: str, language: str, adapter_config: dict, broadcaster):
+    def __init__(self, call_id: str, language: str, adapter_config: dict, broadcaster,
+                 role: str | None = None):
         self.call_id = call_id
         self.language = language
         self.adapter_config = adapter_config
         self.broadcaster = broadcaster  # callable(call_id, event_dict)
+        self.role = role  # "client" / "operator" for dual-leg capture, else None
 
         self._resample_state = None
+        self._resample_rate = None
         self._audio_frames = 0
         self._transcript_path = TRANSCRIPT_DIR / f"{call_id}.jsonl"
+
+        self.recording_path: Path | None = None
+        self._wav_writer: wave.Wave_write | None = None
+        if role is not None:
+            self.recording_path = RECORDINGS_DIR / f"{call_id}.wav"
+            self._wav_writer = wave.open(str(self.recording_path), "wb")
+            self._wav_writer.setnchannels(1)
+            self._wav_writer.setsampwidth(2)
+            self._wav_writer.setframerate(16000)
 
         primary_chain = ROUTING.get(language, ROUTING["ru"])
         self._tracks = [_EngineTrack(call_id, primary_chain, adapter_config, self._on_event, is_primary=True)]
@@ -167,12 +208,18 @@ class CallSession:
         for track in self._tracks:
             await track.start()
 
-    async def feed(self, raw_8k: bytes):
-        """Feed one AudioSocket audio payload (slin, 8kHz mono) to every track."""
+    async def feed(self, raw_audio: bytes, sample_rate: int = 8000):
+        """Feed one AudioSocket audio payload (slin mono, any negotiated rate —
+        see AUDIO_SAMPLE_RATES) to every track, resampled to 16kHz."""
         self._audio_frames += 1
+        if sample_rate != self._resample_rate:
+            self._resample_rate = sample_rate
+            self._resample_state = None  # source rate changed — reset converter state
         pcm16k, self._resample_state = audioop.ratecv(
-            raw_8k, 2, 1, 8000, 16000, self._resample_state
+            raw_audio, 2, 1, sample_rate, 16000, self._resample_state
         )
+        if self._wav_writer is not None:
+            self._wav_writer.writeframes(pcm16k)
         for track in self._tracks:
             await track.feed(pcm16k)
 
@@ -184,23 +231,37 @@ class CallSession:
                 "text": text,
                 "ts": time.time(),
             }
+            if self.role:
+                record["role"] = self.role
             self._persist(record)
             await self.broadcaster(self.call_id, record)
         elif kind == "partial":
-            await self.broadcaster(self.call_id, {
+            event = {
                 "call_id": self.call_id, "engine": engine_name,
                 "partial": text, "ts": time.time(),
-            })
+            }
+            if self.role:
+                event["role"] = self.role
+            await self.broadcaster(self.call_id, event)
         elif kind == "system":
             self._log(f"[{engine_name}] {text}")
 
     def _persist(self, record: dict):
+        # Role-tagged (dual-leg) calls skip the per-call file entirely —
+        # their "final" records already land in the per-engine conversation
+        # files (main.py's broadcast()), and duplicating them here was
+        # redundant. Single-leg calls have no other persistence, so they
+        # keep writing their own file as before.
+        if self.role is not None:
+            return
         with open(self._transcript_path, "a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _log(self, msg: str):
         line = f"[{self.call_id}] {msg}"
         log.info(line)
+        if self.role is not None:
+            return
         with open(self._transcript_path, "a") as f:
             f.write(json.dumps({"call_id": self.call_id, "system": msg, "ts": time.time()},
                                 ensure_ascii=False) + "\n")
@@ -208,4 +269,6 @@ class CallSession:
     async def close(self):
         for track in self._tracks:
             await track.close()
+        if self._wav_writer is not None:
+            self._wav_writer.close()
         self._log(f"call ended, total audio frames: {self._audio_frames}")

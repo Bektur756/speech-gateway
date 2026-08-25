@@ -227,6 +227,41 @@ class WhisperAdapter(STTAdapter):
             await event_queue.put({"type": "fatal", "reason": str(e)})
 
 
+async def transcribe_recording(wav_path, lang: str | None, model_id: str,
+                                chunk_seconds: float = 20.0) -> list[tuple[float, str]]:
+    """Offline, non-streaming transcription of a full call recording.
+
+    Unlike WhisperAdapter.stream's overlapping rolling window (built to
+    keep producing an improving "partial" during a live call), this has no
+    real-time deadline — it walks the recording in sequential,
+    non-overlapping chunks so every second of audio is transcribed exactly
+    once. Returns a list of (offset_seconds, text) for each non-empty
+    chunk. Still bound by the same measured RTF (~3x on this CPU) — a
+    2-minute recording takes several minutes to process; that's expected
+    and fine for a background job with no one waiting on it live.
+    """
+    import wave
+
+    adapter = WhisperAdapter(lang=lang, model_id=model_id)
+    await asyncio.to_thread(adapter._load)
+
+    results = []
+    with wave.open(str(wav_path), "rb") as wf:
+        assert wf.getframerate() == WhisperAdapter.SAMPLE_RATE, \
+            f"expected {WhisperAdapter.SAMPLE_RATE}Hz recording, got {wf.getframerate()}"
+        frames_per_chunk = int(chunk_seconds * wf.getframerate())
+        offset = 0.0
+        while True:
+            data = wf.readframes(frames_per_chunk)
+            if not data:
+                break
+            text = await asyncio.to_thread(adapter._transcribe, data)
+            if text:
+                results.append((offset, text))
+            offset += chunk_seconds
+    return results
+
+
 def build_adapter(name: str, lang: str, *, vosk_ru_url: str, vosk_ky_url: str, airun_key: str,
                    whisper_model_id: str = "/models/kyrgyz-whisper-small") -> STTAdapter:
     if name == "vosk":

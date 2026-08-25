@@ -1,0 +1,15 @@
+[Unit]
+Description=Speech Gateway ARI controller (dual-leg client/operator audio capture)
+After=asterisk.service
+Wants=asterisk.service
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/speech-gateway-ari/env
+ExecStart=/opt/speech-gateway-ari/.venv/bin/python /opt/speech-gateway-ari/controller.py
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -37,8 +37,12 @@ services:
     ports:
       - "9098:9098"   # AudioSocket — ru queue, Asterisk dialplan points here
       - "9099:9099"   # AudioSocket — ky queue
+      - "9100:9100"   # AudioSocket — ky dual-leg, client audio (ARI controller)
+      - "9101:9101"   # AudioSocket — ky dual-leg, operator audio (ARI controller)
     volumes:
       - ./data/transcripts:/data/transcripts
+      # Dual-leg call recordings, for the offline post-call Whisper pass.
+      - ./data/recordings:/data/recordings
       # Both sizes mounted so WHISPER_MODEL_PATH can be flipped to compare
       # small vs medium without rebuilding the image.
       - ./models/kyrgyz-whisper-small:/models/kyrgyz-whisper-small:ro
