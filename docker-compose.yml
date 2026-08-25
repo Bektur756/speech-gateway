@@ -26,12 +26,14 @@ services:
       AUDIOSOCKET_PORT_RU: "9098"
       AUDIOSOCKET_PORT_KY: "9099"
       WHISPER_MODEL_PATH: /models/kyrgyz-whisper-small
-      # Kill switch: Whisper now runs on every live call alongside the
-      # primary Vosk/AiRUN chain (not just as a manual comparison tool).
-      # Real CPU cost under concurrent calls is unmeasured (ТЗ item 3) — set
-      # to "false" here and `docker compose up -d` to disable instantly if
-      # it degrades call quality, no rebuild needed.
-      PARALLEL_STT_ENABLED: "true"
+      # Measured on the real deployment: RTF=3.06 on the "small" model (24.4s
+      # to transcribe an 8s window) — 3x slower than real-time on this
+      # CPU-only box. Live parallel Whisper falls permanently behind and its
+      # inference threads keep running (unkillable via asyncio.cancel) even
+      # after the call ends, burning CPU that Vosk/AiRUN need. Disabled until
+      # there's a GPU or a much faster backend. Flip to "true" + docker
+      # compose up -d to re-enable, no rebuild needed.
+      PARALLEL_STT_ENABLED: "false"
     ports:
       - "9098:9098"   # AudioSocket — ru queue, Asterisk dialplan points here
       - "9099:9099"   # AudioSocket — ky queue
