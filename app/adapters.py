@@ -267,6 +267,13 @@ def build_adapter(name: str, lang: str, *, vosk_ru_url: str, vosk_ky_url: str, a
     if name == "vosk":
         url = vosk_ru_url if lang == "ru" else vosk_ky_url
         return VoskAdapter(url)
+    if name == "vosk-ru":
+        # Distinct name from "vosk" (which already handles ru/ky by lang)
+        # so this can run as its own tagged track alongside a vosk-ky
+        # track in the same call — e.g. comparing the ru model against the
+        # ky model on the same ky-language audio — without both landing
+        # under the same "vosk" engine tag / merged file.
+        return VoskAdapter(vosk_ru_url)
     if name == "airun":
         return AiRUNAdapter(airun_key, lang)
     if name == "whisper":

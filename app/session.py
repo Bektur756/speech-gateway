@@ -54,11 +54,15 @@ TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 RECORDINGS_DIR = Path("/data/recordings")
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-# language -> ordered list of (engine_name, engine_lang); first is primary,
+# language -> ordered list of (build_name, lang, tag); first is primary,
 # rest are fallbacks tried in order if the previous one goes "fatal".
+# build_name selects the adapter via build_adapter(); tag is what shows up
+# in persisted/broadcast "engine" fields and merged filenames — they only
+# differ where one adapter class serves multiple language configs that each
+# need their own distinct output (vosk, whisper).
 ROUTING = {
-    "ru": [("vosk", "ru")],
-    "ky": [("airun", "ky")],
+    "ru": [("vosk", "ru", "vosk")],
+    "ky": [("airun", "ky", "airun")],
 }
 
 # language -> engines that run alongside the primary for the whole call.
@@ -66,19 +70,29 @@ ROUTING = {
 # concern), so their "final" transcripts land side by side in the same
 # JSONL (tagged by "engine") for direct comparison, and the call still gets
 # full Vosk coverage even if AiRUN fails outright (no fallback needed —
-# Vosk was never depending on that happening).
+# Vosk was never depending on that happening). vosk-ru also runs on the
+# same ky-language audio for comparison against the ky-tuned model, tagged
+# as a distinct "vosk-ru" engine (build_adapter already has a dedicated
+# name for it) so it lands in its own file rather than merging into
+# vosk-ky's. Note: vosk-ru and vosk-ky are the same underlying vosk-server
+# code (alphacep image family) — a concurrency bug was found in that
+# server under 2 simultaneous connections (one dual-leg call opens
+# client+operator connections to the same container), so vosk-ru is a real
+# candidate to hit the same issue.
 PARALLEL_ENGINES = {
-    "ky": [("vosk", "ky")],
+    "ky": [("vosk", "ky", "vosk-ky"), ("vosk-ru", "ru", "vosk-ru")],
 }
 
 # Whisper comparison track — separately gated, off by default. Measured
 # RTF=3.06 on this CPU-only box (24s to transcribe one 8s window) means it
 # falls permanently behind live audio, so its "final" only reflects
 # whatever's left in its rolling buffer when the call ends, not the whole
-# conversation — not comparable to Vosk/AiRUN's full-coverage output.
+# conversation — not comparable to Vosk/AiRUN's full-coverage output. (The
+# offline post-call Whisper pass in main.py is unaffected by this and
+# produces its own "whisper-ky"/"whisper-ru" files regardless.)
 if os.environ.get("PARALLEL_STT_ENABLED", "false").lower() not in ("0", "false", "no"):
-    PARALLEL_ENGINES.setdefault("ru", []).append(("whisper", "ru"))
-    PARALLEL_ENGINES.setdefault("ky", []).append(("whisper", "ky"))
+    PARALLEL_ENGINES.setdefault("ru", []).append(("whisper", "ru", "whisper"))
+    PARALLEL_ENGINES.setdefault("ky", []).append(("whisper", "ky", "whisper-ky"))
 
 
 def _normalize(text: str) -> str:
@@ -117,12 +131,12 @@ class _EngineTrack:
                 log.error("[%s] no more engines in fallback chain", self._call_id)
             return
         self._chain_idx = idx
-        name, lang = self.chain[idx]
-        adapter = build_adapter(name, lang, **self.adapter_config)
+        build_name, lang, tag = self.chain[idx]
+        adapter = build_adapter(build_name, lang, **self.adapter_config)
         self._pcm_queue = asyncio.Queue()
         self._last_partial_text = None
         self._last_final_text = None
-        await self.on_event(name, "system", f"engine started: {name} ({lang})")
+        await self.on_event(tag, "system", f"engine started: {tag} ({lang})")
         self._engine_task = asyncio.create_task(
             adapter.stream(self._pcm_queue, self._event_queue)
         )
@@ -134,33 +148,45 @@ class _EngineTrack:
     async def _dispatch_events(self):
         while True:
             ev = await self._event_queue.get()
-            t = ev.get("type")
-            name = self.chain[self._chain_idx][0]
+            try:
+                await self._handle_event(ev)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A downstream failure (e.g. broadcaster/persistence
+                # raising) must not silently kill this loop — that would
+                # stop processing every subsequent event for this track
+                # (all "final"/"partial" output) with no visible error.
+                # Log it and keep going.
+                log.exception("[%s] failed to handle STT event %r", self._call_id, ev.get("type"))
 
-            if t == "final":
-                text = _normalize(ev.get("text", ""))
-                if not text or text == self._last_final_text:
-                    continue
-                self._last_final_text = text
-                self._last_partial_text = None
-                await self.on_event(name, "final", text)
-            elif t == "partial":
-                text = _normalize(ev.get("text", ""))
-                if not text or text == self._last_partial_text:
-                    continue
-                self._last_partial_text = text
-                await self.on_event(name, "partial", text)
-            elif t == "error":
-                await self.on_event(name, "system", f"error: {ev.get('message')}")
-            elif t == "fatal":
-                if self.is_primary:
-                    await self.on_event(name, "system", f"fatal ({ev.get('reason')}) — attempting fallback")
-                    await self._start_engine(self._chain_idx + 1)
-                else:
-                    await self.on_event(name, "system", f"fatal ({ev.get('reason')}) — comparison track stopped")
-                    return
-            elif t == "done":
-                await self.on_event(name, "system", "done")
+    async def _handle_event(self, ev: dict):
+        t = ev.get("type")
+        name = self.chain[self._chain_idx][2]
+
+        if t == "final":
+            text = _normalize(ev.get("text", ""))
+            if not text or text == self._last_final_text:
+                return
+            self._last_final_text = text
+            self._last_partial_text = None
+            await self.on_event(name, "final", text)
+        elif t == "partial":
+            text = _normalize(ev.get("text", ""))
+            if not text or text == self._last_partial_text:
+                return
+            self._last_partial_text = text
+            await self.on_event(name, "partial", text)
+        elif t == "error":
+            await self.on_event(name, "system", f"error: {ev.get('message')}")
+        elif t == "fatal":
+            if self.is_primary:
+                await self.on_event(name, "system", f"fatal ({ev.get('reason')}) — attempting fallback")
+                await self._start_engine(self._chain_idx + 1)
+            else:
+                await self.on_event(name, "system", f"fatal ({ev.get('reason')}) — comparison track stopped")
+        elif t == "done":
+            await self.on_event(name, "system", "done")
 
     async def close(self):
         if self._pcm_queue is not None:
@@ -199,9 +225,9 @@ class CallSession:
 
         primary_chain = ROUTING.get(language, ROUTING["ru"])
         self._tracks = [_EngineTrack(call_id, primary_chain, adapter_config, self._on_event, is_primary=True)]
-        for name, lang in PARALLEL_ENGINES.get(language, []):
+        for build_name, lang, tag in PARALLEL_ENGINES.get(language, []):
             self._tracks.append(
-                _EngineTrack(call_id, [(name, lang)], adapter_config, self._on_event, is_primary=False)
+                _EngineTrack(call_id, [(build_name, lang, tag)], adapter_config, self._on_event, is_primary=False)
             )
 
     async def start(self):

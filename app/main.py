@@ -26,15 +26,16 @@ Client and operator legs land in separate per-call JSONL files by default
 POST /conversations/{conversation_id}/legs {"role", "call_id"} for each leg
 — once linked, every "final" record for that call_id is also appended to
 data/transcripts/conversations/{conversation_id}-{engine}.jsonl (one file
-per STT engine — e.g. "-airun.jsonl", "-vosk.jsonl"), each holding both
-client and operator lines in chronological order, for a clean side-by-side
-comparison between engines at the end of a call.
+per STT engine, each holding both client and operator lines in
+chronological order, for a clean side-by-side comparison at the end of a
+call). Four files per linked call: three live (-airun, -vosk-ky, -vosk-ru
+— see session.py's ROUTING/PARALLEL_ENGINES) and one offline (-whisper-ky
+— see below), all same shape.
 
 A linked call's audio is also recorded (see session.py); once it hangs up,
 an offline Whisper pass runs over the whole recording (no real-time
-deadline, unlike the live comparison track — see adapters.py) and its
-result lands in a third file, {conversation_id}-whisper.jsonl, same shape
-as the other two.
+deadline, unlike the live tracks — see adapters.py / _OFFLINE_WHISPER_PASSES)
+and lands in the last file.
 """
 import asyncio
 import json
@@ -95,29 +96,63 @@ async def broadcast(call_id: str, event: dict):
     if conversation_id and "text" in event:
         engine = event.get("engine", "unknown")
         path = CONVERSATIONS_DIR / f"{conversation_id}-{engine}.jsonl"
-        with open(path, "a") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        try:
+            # Self-healing: CONVERSATIONS_DIR is only created once at
+            # startup, so if it's deleted while the gateway is running
+            # (e.g. manual cleanup), recreate it rather than fail every
+            # write from here on.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except OSError:
+            log.exception("[%s] failed to write conversation transcript %s", call_id, path)
+
+
+_offline_whisper_lock = asyncio.Lock()
+
+
+# lang passed to transcribe_recording -> tag used for the "engine" field
+# (and thus the merged filename). Just the model's native mode: "ky" means
+# unforced/auto-detect (the model's generation_config has no "ky" tag — see
+# adapters.WhisperAdapter). A forced-"ru" second pass was tried and dropped
+# — same model weights either way, so it's a much smaller comparison than
+# vosk-ky vs vosk-ru (genuinely different models), and it doubled offline
+# processing time (RTF~3x per pass) for little payoff.
+_OFFLINE_WHISPER_PASSES = [("ky", "whisper-ky")]
 
 
 async def _run_offline_whisper(call_id: str, role: str, conversation_id: str, recording_path: Path):
-    """Background job kicked off when a linked dual-leg call ends: transcribes
-    its full recording with Whisper (no real-time deadline here, unlike the
-    live comparison track) and appends the result into the third
-    per-conversation file, same shape as the live airun/vosk ones."""
-    try:
-        chunks = await transcribe_recording(recording_path, "ky", WHISPER_MODEL_PATH)
-        for offset, text in chunks:
-            record = {
-                "call_id": call_id, "engine": "whisper", "text": text,
-                "role": role, "offset_seconds": offset, "ts": time.time(),
-            }
-            # broadcast() already appends to CONVERSATIONS_DIR/{id}-whisper.jsonl
-            # (conversation_id is still linked) and pushes to any live WS
-            # subscribers — same path every other engine's finals go through.
-            await broadcast(call_id, record)
-        log.info("[%s] offline whisper transcription complete (%d chunks)", call_id, len(chunks))
-    except Exception:
-        log.exception("[%s] offline whisper transcription failed", call_id)
+    """Background job kicked off when a linked dual-leg call ends: runs both
+    Whisper passes (see _OFFLINE_WHISPER_PASSES) over its full recording (no
+    real-time deadline here, unlike the live comparison track) and appends
+    each into its own per-conversation file, same shape as the live
+    airun/vosk ones.
+
+    Both legs of a call normally end within moments of each other, so their
+    jobs would otherwise run concurrently — confirmed in practice to trip a
+    thread-safety bug in transformers' lazy module import the first time two
+    threads hit it at once (ImportError: cannot import name 'pipeline').
+    Serializing with a lock avoids that race, and avoids heavy CPU-bound
+    inference jobs (RTF~3x each, and now two passes per leg) contending for
+    the same cores anyway — at the cost of taking longer to appear overall.
+    """
+    for lang, tag in _OFFLINE_WHISPER_PASSES:
+        try:
+            async with _offline_whisper_lock:
+                chunks = await transcribe_recording(recording_path, lang, WHISPER_MODEL_PATH)
+            for offset, text in chunks:
+                record = {
+                    "call_id": call_id, "engine": tag, "text": text,
+                    "role": role, "offset_seconds": offset, "ts": time.time(),
+                }
+                # broadcast() already appends to
+                # CONVERSATIONS_DIR/{id}-{tag}.jsonl (conversation_id is
+                # still linked) and pushes to any live WS subscribers —
+                # same path every other engine's finals go through.
+                await broadcast(call_id, record)
+            log.info("[%s] offline %s transcription complete (%d chunks)", call_id, tag, len(chunks))
+        except Exception:
+            log.exception("[%s] offline %s transcription failed", call_id, tag)
 
 
 async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
