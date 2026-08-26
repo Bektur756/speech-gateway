@@ -245,7 +245,15 @@ class CallSession:
             raw_audio, 2, 1, sample_rate, 16000, self._resample_state
         )
         if self._wav_writer is not None:
-            self._wav_writer.writeframes(pcm16k)
+            # Off the event loop: this loop also drains the AudioSocket TCP
+            # stream in real time, and a blocking disk write here (this box
+            # sees real swap pressure) can stall it long enough that
+            # Asterisk's synchronous AudioSocket socket write blocks too —
+            # which backs up frames in the bridge until it hits Asterisk's
+            # internal refcount safety limit and crashes/wedges the channel
+            # (confirmed via a live FRACK assertion in bridge_simple.so
+            # during exactly this scenario).
+            await asyncio.to_thread(self._wav_writer.writeframes, pcm16k)
         for track in self._tracks:
             await track.feed(pcm16k)
 

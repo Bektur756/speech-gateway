@@ -89,6 +89,15 @@ CONVERSATIONS_DIR = Path("/data/transcripts/conversations")
 CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _write_conversation_line(path: Path, event: dict):
+    # Self-healing: CONVERSATIONS_DIR is only created once at startup, so if
+    # it's deleted while the gateway is running (e.g. manual cleanup),
+    # recreate it rather than fail every write from here on.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
 async def broadcast(call_id: str, event: dict):
     for q in _subscribers.get(call_id, []):
         await q.put(event)
@@ -97,13 +106,12 @@ async def broadcast(call_id: str, event: dict):
         engine = event.get("engine", "unknown")
         path = CONVERSATIONS_DIR / f"{conversation_id}-{engine}.jsonl"
         try:
-            # Self-healing: CONVERSATIONS_DIR is only created once at
-            # startup, so if it's deleted while the gateway is running
-            # (e.g. manual cleanup), recreate it rather than fail every
-            # write from here on.
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a") as f:
-                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            # Off the event loop — this call path runs on the same loop
+            # that drains the AudioSocket TCP streams in real time, and a
+            # blocking disk write here can stall it under I/O pressure. See
+            # the matching fix on CallSession.feed's WAV write in
+            # session.py for why that matters on this box specifically.
+            await asyncio.to_thread(_write_conversation_line, path, event)
         except OSError:
             log.exception("[%s] failed to write conversation transcript %s", call_id, path)
 
