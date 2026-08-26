@@ -227,6 +227,16 @@ class WhisperAdapter(STTAdapter):
             await event_queue.put({"type": "fatal", "reason": str(e)})
 
 
+# Reused across calls, keyed by (lang, model_id) — each fresh WhisperAdapter
+# reloads the full model into memory (~1GB, confirmed in production: the
+# gateway process grew to 5.2GB after a handful of calls, all reclaimed
+# instantly by a restart), and that memory was never released between
+# calls. Loading once and reusing the same instance fixes the leak and
+# skips the reload cost on every subsequent call.
+_whisper_adapter_cache: dict[tuple, "WhisperAdapter"] = {}
+_whisper_adapter_cache_lock = asyncio.Lock()
+
+
 async def transcribe_recording(wav_path, lang: str | None, model_id: str,
                                 chunk_seconds: float = 20.0) -> list[tuple[float, str]]:
     """Offline, non-streaming transcription of a full call recording.
@@ -242,8 +252,13 @@ async def transcribe_recording(wav_path, lang: str | None, model_id: str,
     """
     import wave
 
-    adapter = WhisperAdapter(lang=lang, model_id=model_id)
-    await asyncio.to_thread(adapter._load)
+    cache_key = (lang, model_id)
+    async with _whisper_adapter_cache_lock:
+        adapter = _whisper_adapter_cache.get(cache_key)
+        if adapter is None:
+            adapter = WhisperAdapter(lang=lang, model_id=model_id)
+            await asyncio.to_thread(adapter._load)
+            _whisper_adapter_cache[cache_key] = adapter
 
     results = []
     with wave.open(str(wav_path), "rb") as wf:

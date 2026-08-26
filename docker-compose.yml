@@ -3,6 +3,17 @@ services:
     image: alphacep/kaldi-ru:latest
     restart: unless-stopped
     # built-in full-size Russian model, no volume needed
+    #
+    # Needs more RAM than this box currently has to run reliably. Its model
+    # alone uses ~3GB; alongside vosk-ky + gateway on this 7.8GB host, it
+    # crash-loops on load (confirmed: still crash-looped even after fixing
+    # an unrelated gateway memory leak, so it's a standalone problem, not a
+    # side effect of that leak). Deliberately left stopped for now
+    # (`docker compose stop vosk-ru`) — kept in this file rather than
+    # removed so it's easy to bring back once the box has more memory.
+    # `gateway`'s depends_on will auto-restart it on every
+    # `docker compose up gateway`; re-run `docker compose stop vosk-ru`
+    # after any gateway redeploy until this is resolved for good.
 
   vosk-ky:
     # No dedicated alphacep/kaldi-ky image exists — reuse the kaldi-en
@@ -17,7 +28,9 @@ services:
     build: .
     restart: unless-stopped
     depends_on:
-      - vosk-ru
+      # vosk-ru intentionally NOT listed here — see its own comment above.
+      # Listing it would auto-restart it on every `docker compose up
+      # gateway`, undoing the deliberate stop every time.
       - vosk-ky
     environment:
       AIRUN_API_KEY: ${AIRUN_API_KEY}
