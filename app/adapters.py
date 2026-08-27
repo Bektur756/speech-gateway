@@ -43,36 +43,62 @@ class STTAdapter(abc.ABC):
 class VoskAdapter(STTAdapter):
     name = "vosk"
 
+    # The alphacep vosk-server image has a recurring bug (confirmed
+    # third-party, not ours) that kills the connection mid-session with a
+    # 1011 close code. One reconnect attempt keeps a single crash from
+    # taking down the whole comparison track for the rest of the call.
+    MAX_RECONNECTS = 1
+
     def __init__(self, ws_url: str):
         self.ws_url = ws_url  # e.g. ws://vosk-ru:2700 or ws://vosk-ky:2700
 
     async def stream(self, pcm_queue, event_queue):
-        try:
-            async with websockets.connect(self.ws_url, open_timeout=5) as ws:
-                await ws.send(json.dumps({"config": {"sample_rate": 16000}}))
-                await event_queue.put({"type": "ready"})
+        eof_sent = False
+        attempt = 0
+        while True:
+            try:
+                async with websockets.connect(self.ws_url, open_timeout=5) as ws:
+                    await ws.send(json.dumps({"config": {"sample_rate": 16000}}))
+                    if attempt == 0:
+                        await event_queue.put({"type": "ready"})
 
-                async def sender():
-                    while True:
-                        chunk = await pcm_queue.get()
-                        if chunk is None:
-                            await ws.send(json.dumps({"eof": 1}))
-                            return
-                        await ws.send(chunk)
+                    async def sender():
+                        nonlocal eof_sent
+                        while True:
+                            chunk = await pcm_queue.get()
+                            if chunk is None:
+                                await ws.send(json.dumps({"eof": 1}))
+                                eof_sent = True
+                                return
+                            await ws.send(chunk)
 
-                async def receiver():
-                    async for raw in ws:
-                        msg = json.loads(raw)
-                        if "partial" in msg and msg["partial"]:
-                            await event_queue.put({"type": "partial", "text": msg["partial"]})
-                        elif "text" in msg and msg["text"]:
-                            await event_queue.put({"type": "final", "text": msg["text"]})
+                    async def receiver():
+                        async for raw in ws:
+                            msg = json.loads(raw)
+                            if "partial" in msg and msg["partial"]:
+                                await event_queue.put({"type": "partial", "text": msg["partial"]})
+                            elif "text" in msg and msg["text"]:
+                                await event_queue.put({"type": "final", "text": msg["text"]})
 
-                await asyncio.gather(sender(), receiver())
+                    if eof_sent:
+                        # Audio side already finished before the drop — this
+                        # reconnect is only to collect whatever final result
+                        # the crash cut off; pcm_queue is already drained,
+                        # so re-running sender() would just hang.
+                        await ws.send(json.dumps({"eof": 1}))
+                        await receiver()
+                    else:
+                        await asyncio.gather(sender(), receiver())
                 await event_queue.put({"type": "done"})
-        except Exception as e:
-            log.warning("vosk stream failed (%s): %s", self.ws_url, e)
-            await event_queue.put({"type": "fatal", "reason": str(e)})
+                return
+            except Exception as e:
+                attempt += 1
+                if attempt > self.MAX_RECONNECTS:
+                    log.warning("vosk stream failed (%s): %s", self.ws_url, e)
+                    await event_queue.put({"type": "fatal", "reason": str(e)})
+                    return
+                log.warning("vosk stream dropped (%s), reconnecting (%d/%d): %s",
+                            self.ws_url, attempt, self.MAX_RECONNECTS, e)
 
 
 class AiRUNAdapter(STTAdapter):
