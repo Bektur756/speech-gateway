@@ -1,13 +1,14 @@
 """ARI controller — forks client and operator audio separately into the
-Speech Gateway for calls arriving via freeswitch-trunk to extension 102.
+Speech Gateway for calls arriving via freeswitch-trunk to an operator
+extension (101 or 102).
 
 Mechanism: the normal FreePBX dialplan handles the call untouched (Answer,
 Dial, ring, bridge — nothing here interferes with that; client and
 operator hear each other exactly as before). This service just watches
 Asterisk's event stream via ARI (subscribeAll=true, so it sees events for
 channels that never entered any Stasis app) for the moment a
-freeswitch-trunk channel and a 102 channel land in the same bridge. At
-that point, for each of the two channels:
+freeswitch-trunk channel and an operator channel land in the same bridge.
+At that point, for each of the two channels:
 
   1. Snoop it (ARI /channels/{id}/snoop) — spy=in is meant to capture the
      audio coming FROM that channel (i.e. that party's own voice, not
@@ -61,7 +62,10 @@ PORTS = {"client": CLIENT_PORT, "operator": OPERATOR_PORT}
 GATEWAY_HTTP_URL = os.environ.get("GATEWAY_HTTP_URL", f"http://{GATEWAY_HOST}")
 
 TRUNK_PREFIX = "PJSIP/freeswitch-trunk-"
-OPERATOR_PREFIX = "PJSIP/102-"
+# Comma-separated in the env (e.g. "101,102") so new operator extensions can
+# be added without a code change.
+OPERATOR_EXTENSIONS = os.environ.get("OPERATOR_EXTENSIONS", "101,102").split(",")
+OPERATOR_PREFIXES = tuple(f"PJSIP/{ext}-" for ext in OPERATOR_EXTENSIONS)
 
 # See module docstring point 1 — unverified against a real call yet.
 SPY_DIRECTION = os.environ.get("SPY_DIRECTION", "in")
@@ -70,7 +74,7 @@ SPY_DIRECTION = os.environ.get("SPY_DIRECTION", "in")
 def _role_for_channel_name(name: str) -> str | None:
     if name.startswith(TRUNK_PREFIX):
         return "client"
-    if name.startswith(OPERATOR_PREFIX):
+    if name.startswith(OPERATOR_PREFIXES):
         return "operator"
     return None
 
