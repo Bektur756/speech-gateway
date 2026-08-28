@@ -256,10 +256,40 @@ class Controller:
             if {"client", "operator"} <= conv["legs_torn_down"]:
                 self.conversations.pop(leg["bridge_id"], None)
 
+    async def handle_channel_left_bridge(self, event: dict):
+        # Confirmed live (2026-08-28, conversation bea70bc1): a leg's snoop
+        # channel can leave its 2-party capture bridge on its own — cause
+        # still unconfirmed on the Asterisk side — without any
+        # StasisEnd/ChannelDestroyed following. Before this handler existed
+        # that silently killed the leg's audio for the rest of the call:
+        # both channels stayed alive (so teardown_leg, which only fires on
+        # ChannelDestroyed, never ran) but no audio flowed since they were
+        # no longer bridged together. Re-adding both channels to the leg
+        # bridge recovers it without needing to know why it happened.
+        channel = event.get("channel")
+        bridge = event.get("bridge")
+        if not channel or not bridge:
+            return
+        leg = self.leg_by_channel.get(channel["id"])
+        if not leg or leg.get("leg_bridge_id") != bridge["id"]:
+            return
+        log.warning("[%s] %s: channel %s left leg bridge %s unexpectedly — re-adding it",
+                    leg["bridge_id"], leg["role"], channel["id"], bridge["id"])
+        try:
+            await self._rest(
+                "POST", f"/bridges/{bridge['id']}/addChannel",
+                params={"channel": channel["id"]},
+            )
+        except Exception:
+            log.exception("[%s] %s: failed to recover leg bridge after channel left",
+                          leg["bridge_id"], leg["role"])
+
     async def handle_event(self, event: dict):
         etype = event.get("type")
         if etype == "ChannelEnteredBridge":
             await self.handle_channel_entered_bridge(event)
+        elif etype == "ChannelLeftBridge":
+            await self.handle_channel_left_bridge(event)
         elif etype == "StasisStart":
             await self.handle_stasis_start(event)
         elif etype == "StasisEnd":
