@@ -41,6 +41,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 
 import aiohttp
@@ -69,6 +70,8 @@ OPERATOR_PREFIXES = tuple(f"PJSIP/{ext}-" for ext in OPERATOR_EXTENSIONS)
 
 # See module docstring point 1 — unverified against a real call yet.
 SPY_DIRECTION = os.environ.get("SPY_DIRECTION", "in")
+MAX_LEG_RESTARTS = int(os.environ.get("MAX_LEG_RESTARTS", "2"))
+LEG_RESTART_GRACE_SECONDS = float(os.environ.get("LEG_RESTART_GRACE_SECONDS", "1.0"))
 
 
 def _role_for_channel_name(name: str) -> str | None:
@@ -136,7 +139,8 @@ class Controller:
             for chan_id, role in list(conv["legs"].items()):
                 asyncio.create_task(self.start_leg_capture(bridge_id, chan_id, role))
 
-    async def start_leg_capture(self, bridge_id: str, target_channel_id: str, role: str):
+    async def start_leg_capture(self, bridge_id: str, target_channel_id: str, role: str,
+                                restart_count: int = 0):
         snoop_id = f"snoop-{uuid.uuid4()}"
         try:
             snoop = await self._rest(
@@ -149,11 +153,12 @@ class Controller:
                     "snoopId": snoop_id,
                 },
             )
-            leg = {"bridge_id": bridge_id, "role": role, "snoop_id": snoop["id"],
-                   "audiosocket_id": None, "leg_bridge_id": None}
+            leg = {"bridge_id": bridge_id, "role": role, "target_channel_id": target_channel_id,
+                   "snoop_id": snoop["id"], "audiosocket_id": None, "leg_bridge_id": None,
+                   "restart_count": restart_count, "started_at": time.monotonic()}
             self.leg_by_channel[snoop["id"]] = leg
-            log.info("[%s] %s: snoop channel %s created (spy=%s)",
-                      bridge_id, role, snoop.get("id"), SPY_DIRECTION)
+            log.info("[%s] %s: snoop channel %s created (spy=%s restart=%d)",
+                      bridge_id, role, snoop.get("id"), SPY_DIRECTION, restart_count)
         except Exception:
             log.exception("[%s] %s: failed to create snoop channel", bridge_id, role)
 
@@ -237,8 +242,8 @@ class Controller:
             return
         other_ids = [leg.get("snoop_id"), leg.get("audiosocket_id")]
         other_ids = [cid for cid in other_ids if cid and cid != ended_channel_id]
-        log.info("[%s] %s: leg ended, tearing down remaining channels %s",
-                  leg["bridge_id"], leg["role"], other_ids)
+        log.info("[%s] %s: capture channel %s ended, tearing down remaining channels %s",
+                  leg["bridge_id"], leg["role"], ended_channel_id, other_ids)
         for cid in other_ids:
             self.leg_by_channel.pop(cid, None)
             try:
@@ -251,11 +256,47 @@ class Controller:
             except Exception:
                 pass  # bridge auto-destroys once its channels are gone anyway
 
+        if await self.maybe_restart_leg(leg, ended_channel_id):
+            return
+
         conv = self.conversations.get(leg["bridge_id"])
         if conv is not None:
             conv.setdefault("legs_torn_down", set()).add(leg["role"])
             if {"client", "operator"} <= conv["legs_torn_down"]:
                 self.conversations.pop(leg["bridge_id"], None)
+
+    async def maybe_restart_leg(self, leg: dict, ended_channel_id: str) -> bool:
+        restart_count = leg.get("restart_count", 0)
+        if restart_count >= MAX_LEG_RESTARTS:
+            log.warning("[%s] %s: capture leg ended on %s, restart limit reached (%d)",
+                        leg["bridge_id"], leg["role"], ended_channel_id, MAX_LEG_RESTARTS)
+            return False
+
+        # Normal hangup also destroys snoop/AudioSocket channels. Wait briefly,
+        # then verify the original call leg is still alive and still in its
+        # conversation bridge before treating this as a capture-only failure.
+        await asyncio.sleep(LEG_RESTART_GRACE_SECONDS)
+        target_channel_id = leg.get("target_channel_id")
+        if not target_channel_id:
+            return False
+
+        try:
+            await self._rest("GET", f"/channels/{target_channel_id}", quiet=True)
+            bridge = await self._rest("GET", f"/bridges/{leg['bridge_id']}", quiet=True)
+        except Exception:
+            return False
+
+        if target_channel_id not in bridge.get("channels", []):
+            return False
+
+        next_restart = restart_count + 1
+        log.warning("[%s] %s: capture leg ended while target channel is still bridged; "
+                    "restarting capture (attempt %d/%d)",
+                    leg["bridge_id"], leg["role"], next_restart, MAX_LEG_RESTARTS)
+        asyncio.create_task(
+            self.start_leg_capture(leg["bridge_id"], target_channel_id, leg["role"], next_restart)
+        )
+        return True
 
     async def handle_channel_left_bridge(self, event: dict):
         # Confirmed live (2026-08-28, conversation bea70bc1): a leg's snoop
