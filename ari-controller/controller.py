@@ -91,12 +91,13 @@ class Controller:
         #            "leg_bridge_id"}
         self.leg_by_channel: dict[str, dict] = {}
 
-    async def _rest(self, method: str, path: str, **kwargs) -> dict:
+    async def _rest(self, method: str, path: str, quiet: bool = False, **kwargs) -> dict:
         url = f"{ARI_BASE}{path}"
         async with self.session.request(method, url, auth=self.auth, **kwargs) as resp:
             text = await resp.text()
             if resp.status >= 300:
-                log.error("ARI %s %s -> %s: %s", method, path, resp.status, text)
+                if not quiet:
+                    log.error("ARI %s %s -> %s: %s", method, path, resp.status, text)
                 resp.raise_for_status()
             return json.loads(text) if text else {}
 
@@ -258,14 +259,21 @@ class Controller:
 
     async def handle_channel_left_bridge(self, event: dict):
         # Confirmed live (2026-08-28, conversation bea70bc1): a leg's snoop
-        # channel can leave its 2-party capture bridge on its own — cause
+        # channel can leave its 2-party capture bridge mid-call — cause
         # still unconfirmed on the Asterisk side — without any
         # StasisEnd/ChannelDestroyed following. Before this handler existed
         # that silently killed the leg's audio for the rest of the call:
         # both channels stayed alive (so teardown_leg, which only fires on
         # ChannelDestroyed, never ran) but no audio flowed since they were
-        # no longer bridged together. Re-adding both channels to the leg
-        # bridge recovers it without needing to know why it happened.
+        # no longer bridged together. Re-adding the channel recovers it
+        # without needing to know why it happened.
+        #
+        # This event also fires as a completely normal part of a channel's
+        # own hangup sequence (confirmed live 2026-09-01/02: ChannelLeftBridge
+        # immediately followed by StasisEnd/ChannelDestroyed for the same
+        # channel, right as the underlying call ends) — in that case the
+        # re-add below races the channel's teardown and gets a 400 "Channel
+        # not found", which is expected and not worth alarming on.
         channel = event.get("channel")
         bridge = event.get("bridge")
         if not channel or not bridge:
@@ -273,13 +281,21 @@ class Controller:
         leg = self.leg_by_channel.get(channel["id"])
         if not leg or leg.get("leg_bridge_id") != bridge["id"]:
             return
-        log.warning("[%s] %s: channel %s left leg bridge %s unexpectedly — re-adding it",
-                    leg["bridge_id"], leg["role"], channel["id"], bridge["id"])
+        log.info("[%s] %s: channel %s left leg bridge %s — attempting recovery",
+                  leg["bridge_id"], leg["role"], channel["id"], bridge["id"])
         try:
             await self._rest(
                 "POST", f"/bridges/{bridge['id']}/addChannel",
-                params={"channel": channel["id"]},
+                params={"channel": channel["id"]}, quiet=True,
             )
+            log.info("[%s] %s: recovered leg bridge", leg["bridge_id"], leg["role"])
+        except aiohttp.ClientResponseError as e:
+            if e.status == 400:
+                log.info("[%s] %s: channel already gone (likely normal call end), no recovery needed",
+                          leg["bridge_id"], leg["role"])
+            else:
+                log.exception("[%s] %s: failed to recover leg bridge after channel left",
+                              leg["bridge_id"], leg["role"])
         except Exception:
             log.exception("[%s] %s: failed to recover leg bridge after channel left",
                           leg["bridge_id"], leg["role"])
