@@ -39,6 +39,12 @@ services:
     environment:
       VOSK_RU_URL: ws://vosk-ru:2700
       VOSK_KY_URL: ws://vosk-ky:2700
+      # Required unconditionally by app/main.py (os.environ["AIRUN_API_KEY"],
+      # no default) — ky's primary engine is AiRUN per app/session.py's
+      # current ROUTING; without this the process fails at import time and
+      # the whole gateway crash-loops, not just ky calls. Pulled from the
+      # .env file already sitting next to this compose file on the server.
+      AIRUN_API_KEY: ${AIRUN_API_KEY}
       AUDIOSOCKET_PORT_RU: "9098"
       AUDIOSOCKET_PORT_KY: "9099"
       # Whisper is disabled in app/main.py by _OFFLINE_WHISPER_PASSES = [].
@@ -53,7 +59,10 @@ services:
       # there's a GPU or a much faster backend. Flip to "true" + docker
       # compose up -d to re-enable, no rebuild needed.
       PARALLEL_STT_ENABLED: "false"
-      # Run Vosk KY and Vosk RU on each dual-leg KY call for comparison.
+      # app/session.py now runs both vosk-ky and vosk-ru unconditionally as
+      # ky comparison tracks (PARALLEL_ENGINES), not gated by this flag
+      # anymore — kept set for documentation/rollback clarity but currently
+      # has no effect on that code path.
       VOSK_RU_PARALLEL_ENABLED: "true"
     ports:
       - "9098:9098"   # AudioSocket — ru queue, Asterisk dialplan points here
