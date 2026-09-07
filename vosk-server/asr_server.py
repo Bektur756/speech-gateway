@@ -139,7 +139,15 @@ async def handle_connection(ws):
 
 
 async def main():
-    async with websockets.serve(handle_connection, HOST, PORT, max_size=None):
+    # ping_interval disabled: vosk's cffi bindings call into Kaldi via
+    # dlopen (ABI mode), which does not release the GIL for the call's
+    # duration — running AcceptWaveform in a worker thread overlaps I/O
+    # but can't make two decodes run at once, so a busy decode can still
+    # delay this process from answering a ping for a while. That's a
+    # real but harmless slowdown, not a dead peer; the built-in
+    # ping/pong keepalive was misreading it as one and force-closing
+    # with 1011. Matched by ping_interval=None on the client side too.
+    async with websockets.serve(handle_connection, HOST, PORT, max_size=None, ping_interval=None):
         await asyncio.Future()
 
 

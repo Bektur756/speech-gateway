@@ -57,7 +57,21 @@ class VoskAdapter(STTAdapter):
         attempt = 0
         while True:
             try:
-                async with websockets.connect(self.ws_url, open_timeout=5) as ws:
+                # ping_interval disabled: vosk-server's decode call is a
+                # synchronous cffi call into Kaldi that holds the GIL for
+                # its whole duration, so under concurrent connections
+                # (dual-leg calls open 2+ at once) its event loop can go
+                # a while without a chance to answer a ping — a real but
+                # harmless delay, not a dead connection. websockets'
+                # default ping/pong keepalive was treating that delay as
+                # a dead peer and force-closing with 1011, which is worse
+                # than just letting a slow decode run long. The actual
+                # liveness signal here is simpler and stronger anyway:
+                # audio keeps arriving, or eof/the socket closing tells us
+                # the call ended.
+                async with websockets.connect(
+                    self.ws_url, open_timeout=15, ping_interval=None
+                ) as ws:
                     await ws.send(json.dumps({"config": {"sample_rate": 16000}}))
                     if attempt == 0:
                         await event_queue.put({"type": "ready"})
