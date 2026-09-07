@@ -1,52 +1,60 @@
 services:
   vosk-ru:
-    image: alphacep/kaldi-ru:latest
-    restart: unless-stopped
-    # built-in full-size Russian model, no volume needed
+    # Custom server (./vosk-server) replacing alphacep/kaldi-ru:latest —
+    # their reference asr_server.py has a long-standing bug where certain
+    # audio chunks make vosk_recognizer_accept_waveform raise a TypeError
+    # deep in ctypes/cffi handling, and their server doesn't guard against
+    # it: the whole connection dies with a 1011 close, ending live
+    # transcription for whatever call was using it. Confirmed hitting both
+    # vosk-ru and vosk-ky repeatedly. Verified fixed by replaying the exact
+    # recording from a call that crashed this way straight through the
+    # point of the original crash with no interruption.
     #
-    # Needs more RAM than this box currently has to run reliably. Its model
-    # alone uses ~3GB; alongside vosk-ky + gateway on this 7.8GB host, it
-    # crash-loops on load (confirmed: still crash-looped even after fixing
-    # an unrelated gateway memory leak, so it's a standalone problem, not a
-    # side effect of that leak). Deliberately left stopped for now
-    # (`docker compose stop vosk-ru`) — kept in this file rather than
-    # removed so it's easy to bring back once the box has more memory.
-    # `gateway`'s depends_on will auto-restart it on every
-    # `docker compose up gateway`; re-run `docker compose stop vosk-ru`
-    # after any gateway redeploy until this is resolved for good.
+    # Same underlying vosk/Kaldi engine and the same model (extracted from
+    # the original alphacep/kaldi-ru image, confirmed version 0.42 — the
+    # current recommended server-tier Russian model), so no accuracy
+    # change — only the buggy connection-handling code was replaced.
+    build: ./vosk-server
+    restart: unless-stopped
+    environment:
+      VOSK_MODEL_PATH: /opt/vosk-model/model
+    volumes:
+      - ./models/vosk-model-ru-0.42:/opt/vosk-model/model:ro
 
   vosk-ky:
-    # No dedicated alphacep/kaldi-ky image exists — reuse the kaldi-en
-    # server binary and override its model path with the downloaded
-    # Kyrgyz model (works "even for a different language" per alphacep docs).
-    image: alphacep/kaldi-en:latest
+    # Same custom server as vosk-ru above — same fix, same reasoning.
+    build: ./vosk-server
     restart: unless-stopped
+    environment:
+      VOSK_MODEL_PATH: /opt/vosk-model/model
     volumes:
-      - ./models/vosk-model-ky-0.42:/opt/vosk-model-en/model
+      - ./models/vosk-model-ky-0.42:/opt/vosk-model/model:ro
 
   gateway:
     build: .
     restart: unless-stopped
     depends_on:
-      # vosk-ru intentionally NOT listed here — see its own comment above.
-      # Listing it would auto-restart it on every `docker compose up
-      # gateway`, undoing the deliberate stop every time.
+      - vosk-ru
       - vosk-ky
     environment:
-      AIRUN_API_KEY: ${AIRUN_API_KEY}
       VOSK_RU_URL: ws://vosk-ru:2700
       VOSK_KY_URL: ws://vosk-ky:2700
       AUDIOSOCKET_PORT_RU: "9098"
       AUDIOSOCKET_PORT_KY: "9099"
-      WHISPER_MODEL_PATH: /models/kyrgyz-whisper-small
+      # Whisper is disabled in app/main.py by _OFFLINE_WHISPER_PASSES = [].
+      # Re-enable this together with the model volume mounts below if an
+      # offline Whisper comparison pass is needed again.
+      # WHISPER_MODEL_PATH: /models/kyrgyz-whisper-small
       # Measured on the real deployment: RTF=3.06 on the "small" model (24.4s
       # to transcribe an 8s window) — 3x slower than real-time on this
       # CPU-only box. Live parallel Whisper falls permanently behind and its
       # inference threads keep running (unkillable via asyncio.cancel) even
-      # after the call ends, burning CPU that Vosk/AiRUN need. Disabled until
+      # after the call ends, burning CPU that Vosk needs. Disabled until
       # there's a GPU or a much faster backend. Flip to "true" + docker
       # compose up -d to re-enable, no rebuild needed.
       PARALLEL_STT_ENABLED: "false"
+      # Run Vosk KY and Vosk RU on each dual-leg KY call for comparison.
+      VOSK_RU_PARALLEL_ENABLED: "true"
     ports:
       - "9098:9098"   # AudioSocket — ru queue, Asterisk dialplan points here
       - "9099:9099"   # AudioSocket — ky queue
@@ -54,12 +62,12 @@ services:
       - "9101:9101"   # AudioSocket — ky dual-leg, operator audio (ARI controller)
     volumes:
       - ./data/transcripts:/data/transcripts
-      # Dual-leg call recordings, for the offline post-call Whisper pass.
+      # Dual-leg call recordings are kept even while Whisper is disabled.
       - ./data/recordings:/data/recordings
       # Both sizes mounted so WHISPER_MODEL_PATH can be flipped to compare
       # small vs medium without rebuilding the image.
-      - ./models/kyrgyz-whisper-small:/models/kyrgyz-whisper-small:ro
-      - ./models/kyrgyz-whisper-medium:/models/kyrgyz-whisper-medium:ro
+      # - ./models/kyrgyz-whisper-small:/models/kyrgyz-whisper-small:ro
+      # - ./models/kyrgyz-whisper-medium:/models/kyrgyz-whisper-medium:ro
 
   nginx:
     image: nginx:1.27-alpine
