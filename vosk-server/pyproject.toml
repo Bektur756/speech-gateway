@@ -1,0 +1,8 @@
+[project]
+name = "speech-gateway-vosk-server"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "vosk>=0.3.45",
+    "websockets>=17.0.1",
+]
