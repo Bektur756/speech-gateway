@@ -25,11 +25,25 @@ a recognizer error as "drop this one chunk and keep going" instead of
 "tear down the connection". Same behavior for any other unexpected error
 on a single chunk — the goal is that nothing short of the socket actually
 closing can end a session early.
+
+`AcceptWaveform` is a synchronous, CPU-heavy ctypes call into Kaldi. Calling
+it directly from the asyncio handler blocks the whole event loop for its
+duration — with several concurrent connections (e.g. a dual-leg call has
+two, and a comparison track doubles that again), decoding one connection's
+chunk stalls every other connection's I/O too, including the library's own
+ping/pong keepalive and the handshake for any new incoming connection.
+That surfaced for real as "timed out during opening handshake" on new
+connections and "keepalive ping timeout" force-closes (code 1011) on
+established ones — no recognizer crash involved, just a starved event
+loop. Fixed by running AcceptWaveform in a worker thread via
+run_in_executor so the event loop stays free to service other connections
+while Kaldi crunches on one chunk.
 """
 import asyncio
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import websockets
 from vosk import KaldiRecognizer, Model, SetLogLevel
@@ -41,18 +55,26 @@ MODEL_PATH = os.environ["VOSK_MODEL_PATH"]
 HOST = os.environ.get("VOSK_SERVER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("VOSK_SERVER_PORT", "2700"))
 DEFAULT_SAMPLE_RATE = int(os.environ.get("VOSK_DEFAULT_SAMPLE_RATE", "16000"))
+# One decode should never wait behind more than a handful of others queued
+# on the same engine; this is concurrent *connections* per container, not
+# concurrent calls (each dual-leg call opens up to 2 connections to this
+# engine, plus 2 more if it's also running as the comparison track).
+MAX_WORKERS = int(os.environ.get("VOSK_SERVER_MAX_WORKERS", "16"))
 
 SetLogLevel(-1)  # silence Kaldi's own console spam; we log at the connection level ourselves
 
 log.info("loading model from %s ...", MODEL_PATH)
 MODEL = Model(MODEL_PATH)
-log.info("model loaded, listening on ws://%s:%d", HOST, PORT)
+log.info("model loaded, listening on ws://%s:%d (max_workers=%d)", HOST, PORT, MAX_WORKERS)
+
+EXECUTOR = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="kaldi-decode")
 
 
 async def handle_connection(ws):
     peer = ws.remote_address
     sample_rate = DEFAULT_SAMPLE_RATE
     recognizer: KaldiRecognizer | None = None
+    loop = asyncio.get_running_loop()
     log.info("[%s] connection open", peer)
 
     try:
@@ -75,7 +97,8 @@ async def handle_connection(ws):
                 if "eof" in parsed:
                     if recognizer is not None:
                         try:
-                            await ws.send(recognizer.FinalResult())
+                            final = await loop.run_in_executor(EXECUTOR, recognizer.FinalResult)
+                            await ws.send(final)
                         except Exception:
                             log.exception("[%s] error producing final result on eof", peer)
                     break
@@ -93,7 +116,11 @@ async def handle_connection(ws):
                             peer, sample_rate)
 
             try:
-                if recognizer.AcceptWaveform(message):
+                # Off the event loop: this is the blocking Kaldi call that
+                # would otherwise stall every other connection's I/O for
+                # as long as it takes to decode this one chunk.
+                accepted = await loop.run_in_executor(EXECUTOR, recognizer.AcceptWaveform, message)
+                if accepted:
                     await ws.send(recognizer.Result())
                 else:
                     await ws.send(recognizer.PartialResult())
