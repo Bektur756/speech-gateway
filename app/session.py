@@ -60,27 +60,25 @@ RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 # in persisted/broadcast "engine" fields and merged filenames — they only
 # differ where one adapter class serves multiple language configs that each
 # need their own distinct output (vosk, whisper).
+#
+# AiRUN deliberately not used here — Vosk-ky is primary, Vosk-ru runs
+# alongside as a comparison track (see PARALLEL_ENGINES below).
 ROUTING = {
-    "ru": [("vosk", "ru", "vosk")],
-    "ky": [("airun", "ky", "airun")],
+    "ru": [("vosk", "ru", "vosk-ru")],
+    "ky": [("vosk", "ky", "vosk-ky")],
 }
 
 # language -> engines that run alongside the primary for the whole call.
-# Vosk always runs in parallel for ky — both real-time capable (no RTF
-# concern), so their "final" transcripts land side by side in the same
-# JSONL (tagged by "engine") for direct comparison, and the call still gets
-# full Vosk coverage even if AiRUN fails outright (no fallback needed —
-# Vosk was never depending on that happening). vosk-ru also runs on the
-# same ky-language audio for comparison against the ky-tuned model, tagged
-# as a distinct "vosk-ru" engine (build_adapter already has a dedicated
-# name for it) so it lands in its own file rather than merging into
-# vosk-ky's. Note: vosk-ru and vosk-ky are the same underlying vosk-server
-# code (alphacep image family) — a concurrency bug was found in that
-# server under 2 simultaneous connections (one dual-leg call opens
-# client+operator connections to the same container), so vosk-ru is a real
-# candidate to hit the same issue.
+# vosk-ru runs on the same ky-language audio for comparison against the
+# ky-tuned model, tagged as a distinct "vosk-ru" engine (build_adapter
+# already has a dedicated name for it) so it lands in its own file rather
+# than merging into vosk-ky's. Note: vosk-ru and vosk-ky are the same
+# underlying vosk-server code — a concurrency bug was found in that server
+# under 2 simultaneous connections (one dual-leg call opens client+operator
+# connections to the same container), so vosk-ru is a real candidate to hit
+# the same issue (see vosk-server/asr_server.py for the fix).
 PARALLEL_ENGINES = {
-    "ky": [("vosk", "ky", "vosk-ky"), ("vosk-ru", "ru", "vosk-ru")],
+    "ky": [("vosk-ru", "ru", "vosk-ru")],
 }
 
 # Whisper comparison track — separately gated, off by default. Measured

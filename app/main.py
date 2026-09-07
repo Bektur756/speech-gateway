@@ -3,8 +3,8 @@
 AudioSocket TCP listeners — port choice is the only way to tag a connection
 (the AudioSocket protocol carries just a UUID, no room for language/role):
 
-    port 9098  ->  ru,          routed to Vosk
-    port 9099  ->  ky,          routed to AiRUN with Vosk-ky fallback
+    port 9098  ->  ru,          routed to Vosk-ru
+    port 9099  ->  ky,          routed to Vosk-ky
     port 9100  ->  ky + client,   dual-leg capture (see below)
     port 9101  ->  ky + operator, dual-leg capture (see below)
 
@@ -28,9 +28,9 @@ POST /conversations/{conversation_id}/legs {"role", "call_id"} for each leg
 data/transcripts/conversations/{conversation_id}-{engine}.jsonl (one file
 per STT engine, each holding both client and operator lines in
 chronological order, for a clean side-by-side comparison at the end of a
-call). Four files per linked call: three live (-airun, -vosk-ky, -vosk-ru
-— see session.py's ROUTING/PARALLEL_ENGINES) and one offline (-whisper-ky
-— see below), all same shape.
+call). Two files per linked call, both live (-vosk-ky, -vosk-ru — see
+session.py's ROUTING/PARALLEL_ENGINES; AiRUN is defined in adapters.py but
+not currently wired into either), all same shape.
 
 A linked call's audio is also recorded (see session.py); once it hangs up,
 an offline Whisper pass runs over the whole recording (no real-time
