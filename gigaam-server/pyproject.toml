@@ -9,6 +9,13 @@ dependencies = [
     "soundfile>=0.14.0",
     "torch>=2.14.0",
     "torchaudio>=2.11.0",
+    # Both required just to load the model config/class (GigaAM's
+    # modeling file imports them unconditionally), not only for the
+    # pyannote-based transcribe_longform() path this server deliberately
+    # doesn't use — pyannote itself stays out (it's only needed for that
+    # path, and it's a huge dependency: diarization/lightning/etc).
+    "hydra-core>=1.3.6",
+    "omegaconf>=2.3.1",
 ]
 
 # CPU-only wheels — pulling the default (CUDA-linked) build here bloats the
