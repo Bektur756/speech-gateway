@@ -61,6 +61,7 @@ log = logging.getLogger("main")
 AIRUN_API_KEY = os.environ["AIRUN_API_KEY"]
 VOSK_RU_URL = os.environ.get("VOSK_RU_URL", "ws://vosk-ru:2700")
 VOSK_KY_URL = os.environ.get("VOSK_KY_URL", "ws://vosk-ky:2700")
+GIGAAM_URL = os.environ.get("GIGAAM_URL", "ws://gigaam:2700")
 AUDIOSOCKET_HOST = os.environ.get("AUDIOSOCKET_HOST", "0.0.0.0")
 PORT_RU = int(os.environ.get("AUDIOSOCKET_PORT_RU", 9098))
 PORT_KY = int(os.environ.get("AUDIOSOCKET_PORT_KY", 9099))
@@ -81,7 +82,7 @@ FREESWITCH_AUDIO_LANGUAGE = os.environ.get("FREESWITCH_AUDIO_LANGUAGE", "ky")
 FREESWITCH_AUDIO_SAMPLE_RATE = int(os.environ.get("FREESWITCH_AUDIO_SAMPLE_RATE", "16000"))
 
 ADAPTER_CONFIG = dict(vosk_ru_url=VOSK_RU_URL, vosk_ky_url=VOSK_KY_URL, airun_key=AIRUN_API_KEY,
-                       whisper_model_id=WHISPER_MODEL_PATH)
+                       gigaam_url=GIGAAM_URL, whisper_model_id=WHISPER_MODEL_PATH)
 
 # call_id -> list of subscriber queues (for the live WS API)
 _subscribers: dict[str, list[asyncio.Queue]] = {}

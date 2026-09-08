@@ -1,5 +1,11 @@
 services:
   vosk-ru:
+    # Stopped 2026-09-08 — replaced by gigaam (below) as ROUTING's engine
+    # for both languages; see app/session.py's ROUTING comment for why.
+    # Kept, not deleted, for a fast rollback: `docker compose --profile
+    # disabled up -d vosk-ru vosk-ky` brings these back, then point
+    # gateway's VOSK_RU_URL/VOSK_KY_URL/ROUTING at them again.
+    #
     # Custom server (./vosk-server) replacing alphacep/kaldi-ru:latest —
     # their reference asr_server.py has a long-standing bug where certain
     # audio chunks make vosk_recognizer_accept_waveform raise a TypeError
@@ -14,6 +20,7 @@ services:
     # the original alphacep/kaldi-ru image, confirmed version 0.42 — the
     # current recommended server-tier Russian model), so no accuracy
     # change — only the buggy connection-handling code was replaced.
+    profiles: ["disabled"]
     build: ./vosk-server
     restart: unless-stopped
     environment:
@@ -22,7 +29,9 @@ services:
       - ./models/vosk-model-ru-0.42:/opt/vosk-model/model:ro
 
   vosk-ky:
-    # Same custom server as vosk-ru above — same fix, same reasoning.
+    # Same custom server as vosk-ru above — same fix, same reasoning, same
+    # stopped-but-not-deleted status.
+    profiles: ["disabled"]
     build: ./vosk-server
     restart: unless-stopped
     environment:
@@ -30,20 +39,33 @@ services:
     volumes:
       - ./models/vosk-model-ky-0.42:/opt/vosk-model/model:ro
 
+  gigaam:
+    # GigaAM Multilingual (ai-sage/GigaAM-Multilingual, "ctc" revision —
+    # the 220M compact encoder) — one model for both ky and ru, including
+    # code-switched speech within a single utterance. See
+    # gigaam-server/asr_server.py's docstring and app/session.py's ROUTING
+    # comment for the full reasoning and the measured numbers (RTF~0.29 on
+    # this CPU-only box, no GPU needed to start).
+    build: ./gigaam-server
+    restart: unless-stopped
+    volumes:
+      # ~800MB model download persisted here so it survives container
+      # recreation instead of re-fetching from Hugging Face every time.
+      - ./models/gigaam-cache:/root/.cache/huggingface
+
   gateway:
     build: .
     restart: unless-stopped
     depends_on:
-      - vosk-ru
-      - vosk-ky
+      - gigaam
     environment:
-      VOSK_RU_URL: ws://vosk-ru:2700
-      VOSK_KY_URL: ws://vosk-ky:2700
+      GIGAAM_URL: ws://gigaam:2700
       # Required unconditionally by app/main.py (os.environ["AIRUN_API_KEY"],
-      # no default) — ky's primary engine is AiRUN per app/session.py's
-      # current ROUTING; without this the process fails at import time and
-      # the whole gateway crash-loops, not just ky calls. Pulled from the
-      # .env file already sitting next to this compose file on the server.
+      # no default) — even though AiRUN isn't in ROUTING/PARALLEL_ENGINES
+      # right now, main.py still imports it at module load, so a missing
+      # key crash-loops the whole gateway, not just one engine. Pulled
+      # from the .env file already sitting next to this compose file on
+      # the server.
       AIRUN_API_KEY: ${AIRUN_API_KEY}
       AUDIOSOCKET_PORT_RU: "9098"
       AUDIOSOCKET_PORT_KY: "9099"
@@ -53,17 +75,9 @@ services:
       # WHISPER_MODEL_PATH: /models/kyrgyz-whisper-small
       # Measured on the real deployment: RTF=3.06 on the "small" model (24.4s
       # to transcribe an 8s window) — 3x slower than real-time on this
-      # CPU-only box. Live parallel Whisper falls permanently behind and its
-      # inference threads keep running (unkillable via asyncio.cancel) even
-      # after the call ends, burning CPU that Vosk needs. Disabled until
-      # there's a GPU or a much faster backend. Flip to "true" + docker
-      # compose up -d to re-enable, no rebuild needed.
+      # CPU-only box. Disabled until there's a GPU or a much faster backend.
+      # Flip to "true" + docker compose up -d to re-enable, no rebuild needed.
       PARALLEL_STT_ENABLED: "false"
-      # app/session.py now runs both vosk-ky and vosk-ru unconditionally as
-      # ky comparison tracks (PARALLEL_ENGINES), not gated by this flag
-      # anymore — kept set for documentation/rollback clarity but currently
-      # has no effect on that code path.
-      VOSK_RU_PARALLEL_ENABLED: "true"
     ports:
       - "9098:9098"   # AudioSocket — ru queue, Asterisk dialplan points here
       - "9099:9099"   # AudioSocket — ky queue

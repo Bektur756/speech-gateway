@@ -1,0 +1,27 @@
+[project]
+name = "gigaam-server"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "websockets>=17.0.1",
+    "transformers>=5.16.1",
+    "sentencepiece>=0.2.2",
+    "soundfile>=0.14.0",
+    "torch>=2.14.0",
+    "torchaudio>=2.11.0",
+]
+
+# CPU-only wheels — pulling the default (CUDA-linked) build here bloats the
+# image with unusable CUDA libs and, worse, torchaudio's default build
+# expects a matching CUDA torch and fails to load entirely against a CPU
+# one (hit this exact mismatch prototyping on the target box: torchaudio
+# from the default index couldn't find libcudart.so.13 against a CPU-only
+# torch). Both must come from the same index for their versions to match.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchaudio = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -61,25 +61,27 @@ RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 # differ where one adapter class serves multiple language configs that each
 # need their own distinct output (vosk, whisper).
 #
-# AiRUN deliberately not used here — Vosk-ky is primary, Vosk-ru runs
-# alongside as a comparison track (see PARALLEL_ENGINES below).
+# GigaAM Multilingual replaces both vosk-ky and vosk-ru (2026-09-08) — one
+# model covers both languages, including code-switched speech within a
+# single utterance, which the vosk-ky/vosk-ru split couldn't: vosk-ky
+# hallucinated fluent-sounding but unrelated Kyrgyz when fed Russian
+# speech (confirmed live — fed the same clip to vosk-ru instead and got
+# sensible output), because a single-language model has no way to
+# recognize audio outside its language, only to force-fit it into one.
+# Compared directly against vosk-ky on a real production call recording
+# (see gigaam-server/asr_server.py's docstring): fewer garbled words,
+# correct quantities/dish names it had gotten wrong. Measured RTF~0.29 on
+# this CPU-only box — real-time capable without a GPU, ~10x faster than
+# Whisper-small was here. vosk-ky/vosk-ru are stopped (see
+# docker-compose.yml's "disabled" profile) but not deleted, for a fast
+# rollback if GigaAM doesn't hold up under real concurrent-call load —
+# that hasn't been tested yet, only single-call.
 ROUTING = {
-    "ru": [("vosk", "ru", "vosk-ru")],
-    "ky": [("vosk", "ky", "vosk-ky")],
+    "ru": [("gigaam", "ru", "gigaam")],
+    "ky": [("gigaam", "ky", "gigaam")],
 }
 
-# language -> engines that run alongside the primary for the whole call.
-# vosk-ru runs on the same ky-language audio for comparison against the
-# ky-tuned model, tagged as a distinct "vosk-ru" engine (build_adapter
-# already has a dedicated name for it) so it lands in its own file rather
-# than merging into vosk-ky's. Note: vosk-ru and vosk-ky are the same
-# underlying vosk-server code — a concurrency bug was found in that server
-# under 2 simultaneous connections (one dual-leg call opens client+operator
-# connections to the same container), so vosk-ru is a real candidate to hit
-# the same issue (see vosk-server/asr_server.py for the fix).
-PARALLEL_ENGINES = {
-    "ky": [("vosk-ru", "ru", "vosk-ru")],
-}
+PARALLEL_ENGINES = {}
 
 # Whisper comparison track — separately gated, off by default. Measured
 # RTF=3.06 on this CPU-only box (24s to transcribe one 8s window) means it

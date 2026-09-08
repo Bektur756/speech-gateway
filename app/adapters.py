@@ -169,6 +169,19 @@ class AiRUNAdapter(STTAdapter):
             await event_queue.put({"type": "fatal", "reason": str(e)})
 
 
+class GigaAMAdapter(VoskAdapter):
+    """GigaAM Multilingual, behind gigaam-server (see that directory).
+
+    Identical wire protocol to VoskAdapter's — gigaam-server was built to
+    speak it on purpose — so this only exists to give it its own name/tag
+    rather than showing up as "vosk" in logs and transcripts. One model
+    covers both ky and ru (including code-switched speech within a single
+    utterance), so unlike vosk_ru_url/vosk_ky_url there's just one URL
+    regardless of lang.
+    """
+    name = "gigaam"
+
+
 class WhisperAdapter(STTAdapter):
     """Windowed pseudo-streaming adapter around a local Whisper model.
 
@@ -318,6 +331,7 @@ async def transcribe_recording(wav_path, lang: str | None, model_id: str,
 
 
 def build_adapter(name: str, lang: str, *, vosk_ru_url: str, vosk_ky_url: str, airun_key: str,
+                   gigaam_url: str | None = None,
                    whisper_model_id: str = "/models/kyrgyz-whisper-small") -> STTAdapter:
     if name == "vosk":
         url = vosk_ru_url if lang == "ru" else vosk_ky_url
@@ -329,6 +343,8 @@ def build_adapter(name: str, lang: str, *, vosk_ru_url: str, vosk_ky_url: str, a
         # ky model on the same ky-language audio — without both landing
         # under the same "vosk" engine tag / merged file.
         return VoskAdapter(vosk_ru_url)
+    if name == "gigaam":
+        return GigaAMAdapter(gigaam_url)
     if name == "airun":
         return AiRUNAdapter(airun_key, lang)
     if name == "whisper":
