@@ -9,13 +9,20 @@ dependencies = [
     "soundfile>=0.14.0",
     "torch>=2.14.0",
     "torchaudio>=2.11.0",
-    # Both required just to load the model config/class (GigaAM's
-    # modeling file imports them unconditionally), not only for the
-    # pyannote-based transcribe_longform() path this server deliberately
-    # doesn't use — pyannote itself stays out (it's only needed for that
-    # path, and it's a huge dependency: diarization/lightning/etc).
+    # Required just to load the model config/class (GigaAM's modeling
+    # file imports them unconditionally) — transformers' dynamic-module
+    # loader scans every import in that file upfront and refuses to
+    # define the class unless all of them resolve, regardless of which
+    # code paths actually run.
     "hydra-core>=1.3.6",
     "omegaconf>=2.3.1",
+    # Same story: only actually used by the pyannote-based
+    # transcribe_longform() path this server deliberately doesn't call
+    # (see asr_server.py's docstring — needs a gated HF model + token),
+    # but still has to be importable or the class fails to load at all.
+    # Never triggers a download/auth attempt since transcribe_longform()
+    # is never invoked here.
+    "pyannote.audio>=4.0.7",
 ]
 
 # CPU-only wheels — pulling the default (CUDA-linked) build here bloats the
