@@ -58,6 +58,8 @@ services:
     restart: unless-stopped
     depends_on:
       - gigaam
+    env_file:
+      - .env
     environment:
       GIGAAM_URL: ws://gigaam:2700
       # Required unconditionally by app/main.py (os.environ["AIRUN_API_KEY"],
@@ -78,6 +80,9 @@ services:
       # CPU-only box. Disabled until there's a GPU or a much faster backend.
       # Flip to "true" + docker compose up -d to re-enable, no rebuild needed.
       PARALLEL_STT_ENABLED: "false"
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY}
+      VAPID_PRIVATE_KEY_PATH: keys/private_key.pem
+      VAPID_SUBJECT: mailto:you@yourdomain.com
     ports:
       - "9098:9098"   # AudioSocket — ru queue, Asterisk dialplan points here
       - "9099:9099"   # AudioSocket — ky queue
@@ -91,6 +96,8 @@ services:
       # small vs medium without rebuilding the image.
       # - ./models/kyrgyz-whisper-small:/models/kyrgyz-whisper-small:ro
       # - ./models/kyrgyz-whisper-medium:/models/kyrgyz-whisper-medium:ro
+      - ./data/push_subscriptions.json:/data/push_subscriptions.json
+      - ./keys:/srv/keys:ro
 
   nginx:
     image: nginx:1.27-alpine
@@ -101,3 +108,17 @@ services:
       - "80:80"       # WS API /calls/{id}/stream for external consumers
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+
+  # Optional live frontend development service (Vite HMR on port 5173).
+  # Run with: docker compose --profile dev up frontend-dev
+  frontend-dev:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev"
+    profiles: ["dev"]
+

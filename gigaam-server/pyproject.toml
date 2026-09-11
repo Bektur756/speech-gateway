@@ -23,6 +23,7 @@ dependencies = [
     # Never triggers a download/auth attempt since transcribe_longform()
     # is never invoked here.
     "pyannote.audio>=4.0.7",
+    "webrtcvad-wheels>=2.0.14",
 ]
 
 # CPU-only wheels — pulling the default (CUDA-linked) build here bloats the

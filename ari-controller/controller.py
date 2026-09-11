@@ -341,12 +341,82 @@ class Controller:
             log.exception("[%s] %s: failed to recover leg bridge after channel left",
                           leg["bridge_id"], leg["role"])
 
+    async def hold_call(self, bridge_id: str):
+        """Places the client channel of the bridged conversation on hold."""
+        conv = self.conversations.get(bridge_id)
+        if not conv:
+            log.warning("[%s] hold requested for unknown bridge", bridge_id)
+            return
+
+        # Identify the client channel (the caller to be held with Music on Hold)
+        client_channel_id = None
+        for chan_id, role in conv.get("legs", {}).items():
+            if role == "client":
+                client_channel_id = chan_id
+                break
+
+        if not client_channel_id:
+            log.warning("[%s] cannot find client channel to hold", bridge_id)
+            return
+
+        try:
+            # If channels are in Stasis:
+            await self._rest("POST", f"/channels/{client_channel_id}/hold")
+            log.info("[%s] client channel %s placed on hold", bridge_id, client_channel_id)
+        except aiohttp.ClientResponseError as e:
+            if e.status == 409:
+                # Channel is in native PBX dialplan, not in Stasis.
+                # Use Asterisk CLI / AMI redirect to parking/MOH context:
+                proc = await asyncio.create_subprocess_exec(
+                    "asterisk", "-rx", f"channel redirect {client_channel_id} park-hints,701,1"
+                )
+                await proc.wait()
+                log.info("[%s] channel redirected to park/hold via asterisk CLI", bridge_id)
+            else:
+                log.exception("[%s] failed to hold channel %s", bridge_id, client_channel_id)
+
+    async def unhold_call(self, bridge_id: str):
+        conv = self.conversations.get(bridge_id)
+        if not conv:
+            return
+        client_channel_id = next((cid for cid, role in conv.get("legs", {}).items() if role == "client"), None)
+        if not client_channel_id:
+            return
+
+        try:
+            await self._rest("DELETE", f"/channels/{client_channel_id}/hold")
+            log.info("[%s] client channel %s resumed from hold", bridge_id, client_channel_id)
+        except aiohttp.ClientResponseError as e:
+            if e.status == 409:
+                log.info("[%s] unhold via CLI/dialplan required for non-Stasis channels", bridge_id)
+
+    async def command_listener(controller: Controller):
+        ws_url = f"{GATEWAY_HTTP_URL.replace('http', 'ws')}/controller/ws"
+        while True:
+            try:
+                async with controller.session.ws_connect(ws_url) as ws:
+                    log.info("Connected to speech-gateway control channel")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = msg.json()
+                            cmd = data.get("command")
+                            cid = data.get("conversation_id")
+                            if cmd == "hold":
+                                await controller.hold_call(cid)
+                            elif cmd == "unhold":
+                                await controller.unhold_call(cid)
+            except Exception:
+                await asyncio.sleep(5)
+
+
     async def handle_event(self, event: dict):
         etype = event.get("type")
         if etype == "ChannelEnteredBridge":
             await self.handle_channel_entered_bridge(event)
         elif etype == "ChannelLeftBridge":
             await self.handle_channel_left_bridge(event)
+        elif etype == "ChannelHold":
+            await self.handle_channel_hold(event)
         elif etype == "StasisStart":
             await self.handle_stasis_start(event)
         elif etype == "StasisEnd":
@@ -362,6 +432,7 @@ async def main():
         ws_scheme = "wss" if ARI_BASE.startswith("https://") else "ws"
         ws_host = ARI_BASE.split("://", 1)[1]
         ws_url = f"{ws_scheme}://{ws_host}/events?app={STASIS_APP}&subscribeAll=true"
+        asyncio.create_task(command_listener(controller))
 
         while True:
             try:

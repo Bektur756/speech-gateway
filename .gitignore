@@ -13,3 +13,7 @@ __pycache__/
 # Large local assets — fetched separately, not tracked (see README/TZ)
 models/
 data/
+
+# Frontend
+node_modules/
+dist/

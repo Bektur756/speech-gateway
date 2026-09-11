@@ -44,16 +44,22 @@ import logging
 import os
 import re
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from dotenv import load_dotenv
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from pywebpush import webpush, WebPushException
 
 from .adapters import transcribe_recording
 from .audiosocket import read_frame, TYPE_UUID, TYPE_ERROR, TYPE_TERMINATE, AUDIO_SAMPLE_RATES
 from .session import CallSession
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("main")
@@ -83,6 +89,39 @@ FREESWITCH_AUDIO_SAMPLE_RATE = int(os.environ.get("FREESWITCH_AUDIO_SAMPLE_RATE"
 
 ADAPTER_CONFIG = dict(vosk_ru_url=VOSK_RU_URL, vosk_ky_url=VOSK_KY_URL, airun_key=AIRUN_API_KEY,
                        gigaam_url=GIGAAM_URL, whisper_model_id=WHISPER_MODEL_PATH)
+
+# --- Push notification on new call (browser Web Push, no app required) ---
+# Standard W3C Push API: the browser itself is the client, via a service
+# worker — nothing to install from an app store, just a page visited once
+# to hit "Enable notifications". Delivery still goes through the browser
+# vendor's own push relay (Google/Mozilla/Apple — that's how Web Push works
+# for every site that uses it), but there's no account, API key, or SDK of
+# ours in the loop. Generate a VAPID key pair once (see README/deploy notes)
+# and set these three; leave VAPID_PUBLIC_KEY unset to disable.
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "")
+VAPID_PRIVATE_KEY_PATH = os.environ.get("VAPID_PRIVATE_KEY_PATH", "private_key.pem")
+VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:admin@example.com")
+
+# Subscriptions are what registration.pushManager.subscribe() hands back in
+# the browser — one per browser/device that clicked "Enable notifications".
+# Persisted to disk (same /data volume as everything else here) so they
+# survive a gateway restart instead of forcing everyone to re-subscribe.
+PUSH_SUBSCRIPTIONS_PATH = Path("/data/push_subscriptions.json")
+PUSH_SUBSCRIPTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _load_push_subscriptions() -> list[dict]:
+    try:
+        return json.loads(PUSH_SUBSCRIPTIONS_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+_push_subscriptions: list[dict] = _load_push_subscriptions()
+
+
+def _save_push_subscriptions():
+    PUSH_SUBSCRIPTIONS_PATH.write_text(json.dumps(_push_subscriptions, ensure_ascii=False))
 
 # call_id -> list of subscriber queues (for the live WS API)
 _subscribers: dict[str, list[asyncio.Queue]] = {}
@@ -159,6 +198,72 @@ def _active_call_ids() -> list[str]:
     return sorted({_call_to_conversation.get(call_id, call_id) for call_id in _sessions})
 
 
+def _send_push(title: str, body: str):
+    # Synchronous by design (pywebpush/requests has no async variant) —
+    # always called via asyncio.to_thread from notify_new_call, never
+    # directly on the event loop.
+    if not _push_subscriptions:
+        return
+    payload = json.dumps({"title": title, "body": body})
+    stale = []
+    for sub in list(_push_subscriptions):
+        try:
+            webpush(
+                subscription_info=sub,
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY_PATH,
+                vapid_claims={"sub": VAPID_SUBJECT},
+            )
+        except WebPushException as ex:
+            status = ex.response.status_code if ex.response is not None else None
+            if status in (404, 410):
+                # Browser/OS says this subscription is gone for good
+                # (uninstalled, permission revoked, etc.) — drop it rather
+                # than retrying it on every future call.
+                stale.append(sub)
+            else:
+                log.warning("push notification failed: %s", ex)
+        except Exception:
+            log.exception("push notification failed")
+    if stale:
+        for sub in stale:
+            _push_subscriptions.remove(sub)
+        _save_push_subscriptions()
+
+
+def notify_new_call(call_id: str, language: str, role: str | None = None):
+    """Fire a push notification for a newly-started call. Schedules the
+    (blocking) HTTP POST(s) on a background thread and returns immediately —
+    never awaited, never raises into the caller, and a no-op if no VAPID key
+    is configured."""
+    if not VAPID_PUBLIC_KEY:
+        return
+    detail = f"{call_id} ({language}{', ' + role if role else ''})"
+    asyncio.create_task(asyncio.to_thread(_send_push, "New call", detail))
+
+
+PUSH_SERVICE_WORKER_JS = """
+self.addEventListener('push', (event) => {
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch (e) { /* ignore */ }
+  event.waitUntil(self.registration.showNotification(data.title || 'New call', {
+    body: data.body || '',
+    tag: 'new-call',
+  }));
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil(clients.openWindow('/live'));
+});
+"""
+
+
+class PushSubscription(BaseModel):
+    endpoint: str
+    keys: dict
+
+
 async def _start_freeswitch_stereo_sessions(metadata: dict) -> tuple[str, CallSession, CallSession]:
     base_id = _safe_id(
         metadata.get("uuid") or metadata.get("call_id") or metadata.get("Unique-ID"),
@@ -177,6 +282,7 @@ async def _start_freeswitch_stereo_sessions(metadata: dict) -> tuple[str, CallSe
 
     await client_session.start()
     await operator_session.start()
+    notify_new_call(base_id, language)
     log.info(
         "[%s] FreeSWITCH stereo stream started: client=%s operator=%s metadata=%s",
         base_id, client_id, operator_id, metadata,
@@ -271,6 +377,13 @@ async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 session = CallSession(call_id, language, ADAPTER_CONFIG, broadcast, role=role)
                 _sessions[call_id] = session
                 await session.start()
+                # Skip the "operator" leg of a dual-leg call: the ARI
+                # controller opens the client leg (port 9100) alongside it
+                # for the same physical call, so notifying on that leg only
+                # keeps this to one push per call instead of two. Single-leg
+                # ru/ky calls (role is None) always notify.
+                if role != "operator":
+                    notify_new_call(call_id, language, role)
 
             elif kind in AUDIO_SAMPLE_RATES and session is not None:
                 await session.feed(payload, sample_rate=AUDIO_SAMPLE_RATES[kind])
@@ -330,6 +443,67 @@ async def health():
     return {"status": "ok", "active_calls": list(_sessions.keys())}
 
 
+@app.get("/sw.js")
+async def push_service_worker():
+    return Response(content=PUSH_SERVICE_WORKER_JS, media_type="application/javascript")
+
+
+@app.get("/push/vapid-public-key", response_class=PlainTextResponse)
+async def push_vapid_public_key():
+    return VAPID_PUBLIC_KEY
+
+
+@app.post("/push/subscribe")
+async def push_subscribe(sub: PushSubscription):
+    entry = sub.dict()
+    if entry not in _push_subscriptions:
+        _push_subscriptions.append(entry)
+        await asyncio.to_thread(_save_push_subscriptions)
+    return {"status": "ok"}
+
+
+@app.post("/push/test")
+async def push_test():
+    """Diagnostic only — unlike notify_new_call (fire-and-forget, used on
+    the real call-start path so it never blocks audio handling), this
+    awaits each send and reports the real per-subscription result, so you
+    can actually see *why* nothing arrived instead of always getting back
+    a blind "ok"."""
+    if not VAPID_PUBLIC_KEY:
+        return {"error": "VAPID_PUBLIC_KEY is not set — push is disabled"}
+    if not _push_subscriptions:
+        return {"error": "no saved subscriptions — open /live and click "
+                         "'Enable notifications' first"}
+
+    def _send_one(sub: dict):
+        webpush(
+            subscription_info=sub,
+            data=json.dumps({"title": "Test push", "body": "It works"}),
+            vapid_private_key=VAPID_PRIVATE_KEY_PATH,
+            vapid_claims={"sub": VAPID_SUBJECT},
+        )
+
+    results = []
+    for sub in _push_subscriptions:
+        endpoint = sub.get("endpoint", "?")[:60] + "..."
+        try:
+            await asyncio.to_thread(_send_one, sub)
+            results.append({"endpoint": endpoint, "status": "sent"})
+        except WebPushException as ex:
+            status = ex.response.status_code if ex.response is not None else None
+            results.append({
+                "endpoint": endpoint, "status": "failed",
+                "http_status": status, "error": str(ex),
+            })
+        except Exception as ex:
+            # e.g. VAPID_PRIVATE_KEY_PATH not readable — fails before any
+            # network call is even made, never a WebPushException.
+            results.append({
+                "endpoint": endpoint, "status": "failed",
+                "error": f"{type(ex).__name__}: {ex}",
+            })
+    return {"results": results}
+
 class ConversationLeg(BaseModel):
     role: str
     call_id: str
@@ -339,6 +513,33 @@ class ConversationLeg(BaseModel):
 async def link_conversation_leg(conversation_id: str, leg: ConversationLeg):
     _call_to_conversation[leg.call_id] = conversation_id
     return {"status": "ok"}
+
+
+@app.post("/conversations/{conversation_id}/hold")
+async def hold_conversation(conversation_id: str):
+    await broadcast(conversation_id, {
+        "type": "channel_hold",
+        "hold": True,
+        "conversation_id": conversation_id,
+        "role": "system",
+        "text": "[Call placed on hold]",
+        "ts": time.time(),
+    })
+    return {"status": "ok", "action": "hold", "conversation_id": conversation_id}
+
+
+@app.post("/conversations/{conversation_id}/unhold")
+async def unhold_conversation(conversation_id: str):
+    await broadcast(conversation_id, {
+        "type": "channel_unhold",
+        "hold": False,
+        "conversation_id": conversation_id,
+        "role": "system",
+        "text": "[Call resumed from hold]",
+        "ts": time.time(),
+    })
+    return {"status": "ok", "action": "unhold", "conversation_id": conversation_id}
+
 
 
 @app.websocket("/calls/{call_id}/stream")
@@ -355,270 +556,14 @@ async def stream_call(ws: WebSocket, call_id: str):
     finally:
         _subscribers[call_id].remove(q)
 
-
-LIVE_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Live Transcription</title>
-  <style>
-    :root {
-      color-scheme: light dark;
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --text: #17202a;
-      --muted: #667085;
-      --border: #d6dae1;
-      --client: #0f766e;
-      --operator: #7c3aed;
-      --system: #6b7280;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #101317;
-        --panel: #181c22;
-        --text: #eceff3;
-        --muted: #9aa4b2;
-        --border: #303844;
-      }
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--bg);
-      color: var(--text);
-    }
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 16px 20px;
-      border-bottom: 1px solid var(--border);
-      background: var(--panel);
-      position: sticky;
-      top: 0;
-      z-index: 2;
-    }
-    h1 {
-      margin: 0;
-      font-size: 18px;
-      font-weight: 650;
-    }
-    #status {
-      font-size: 13px;
-      color: var(--muted);
-      white-space: nowrap;
-    }
-    main {
-      max-width: 1100px;
-      margin: 0 auto;
-      padding: 18px 20px 40px;
-    }
-    .toolbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 14px;
-    }
-    button {
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      background: var(--panel);
-      color: var(--text);
-      padding: 8px 11px;
-      cursor: pointer;
-    }
-    .layout {
-      display: grid;
-      grid-template-columns: 280px minmax(0, 1fr);
-      gap: 16px;
-    }
-    #calls, #events {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .call {
-      width: 100%;
-      text-align: left;
-      padding: 12px;
-    }
-    .call.selected { border-color: var(--client); outline: 2px solid color-mix(in srgb, var(--client) 25%, transparent); }
-    .call-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
-    .call-state { color: var(--muted); font-size: 12px; margin-top: 5px; }
-    .row {
-      display: grid;
-      grid-template-columns: 92px 112px 1fr;
-      gap: 10px;
-      align-items: start;
-      padding: 10px 12px;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-    }
-    .meta {
-      color: var(--muted);
-      font-size: 12px;
-      overflow-wrap: anywhere;
-    }
-    .role {
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-    }
-    .client { color: var(--client); }
-    .operator { color: var(--operator); }
-    .system { color: var(--system); }
-    .text {
-      font-size: 15px;
-      line-height: 1.45;
-      overflow-wrap: anywhere;
-    }
-    .partial .text { color: var(--muted); }
-    @media (max-width: 700px) {
-      header, .toolbar { align-items: flex-start; flex-direction: column; }
-      .row { grid-template-columns: 1fr; }
-      .layout { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>Live Transcription</h1>
-    <div id="status">connecting</div>
-  </header>
-  <main>
-    <div class="toolbar">
-      <div id="summary" class="meta">No active calls</div>
-      <button id="clear" type="button">Clear transcript</button>
-    </div>
-    <div class="layout">
-      <section>
-        <div class="meta" style="margin-bottom:8px">Active calls</div>
-        <div id="calls"></div>
-      </section>
-      <section id="events"><div class="meta">Select a call to view its realtime transcript.</div></section>
-    </div>
-  </main>
-  <script>
-    const statusEl = document.getElementById("status");
-    const summaryEl = document.getElementById("summary");
-    const callsEl = document.getElementById("calls");
-    const eventsEl = document.getElementById("events");
-    const clearEl = document.getElementById("clear");
-    const calls = new Map();
-    let selectedCall = null;
-    let socket;
-
-    function roleClass(role) {
-      if (role === "client") return "client";
-      if (role === "operator") return "operator";
-      return "system";
-    }
-
-    function formatTime(ts) {
-      if (!ts) return new Date().toLocaleTimeString();
-      return new Date(ts * 1000).toLocaleTimeString();
-    }
-
-    function callKey(event) {
-      return event.conversation_id || event.call_id || "unknown";
-    }
-
-    function renderCalls() {
-      callsEl.replaceChildren();
-      const active = [...calls.values()].filter(call => call.active);
-      summaryEl.textContent = active.length + (active.length === 1 ? " active call" : " active calls");
-      for (const call of active) {
-        const button = document.createElement("button");
-        button.className = "call" + (call.id === selectedCall ? " selected" : "");
-        button.type = "button";
-        button.innerHTML = `<div class="call-id"></div><div class="call-state">${call.events.length} events</div>`;
-        button.querySelector(".call-id").textContent = call.id;
-        button.onclick = () => { selectedCall = call.id; renderCalls(); renderTranscript(); };
-        callsEl.append(button);
-      }
-    }
-
-    function renderTranscript() {
-      eventsEl.replaceChildren();
-      const call = calls.get(selectedCall);
-      if (!call) {
-        eventsEl.innerHTML = '<div class="meta">Select a call to view its realtime transcript.</div>';
-        return;
-      }
-      for (const event of call.events) {
-        if (event.type === "call_started" || event.type === "call_ended") continue;
-        const row = document.createElement("article");
-        const role = event.role || "system";
-        const text = event.text || event.partial || event.system || "";
-        row.className = "row " + (event.partial ? "partial" : "final");
-        row.innerHTML = `
-          <div class="meta">${formatTime(event.ts)}</div>
-          <div class="role ${roleClass(role)}">${role}</div>
-          <div><div class="text"></div><div class="meta engine"></div></div>`;
-        row.querySelector(".text").textContent = text;
-        row.querySelector(".engine").textContent = event.engine || "system";
-        eventsEl.append(row);
-      }
-      eventsEl.scrollTop = eventsEl.scrollHeight;
-    }
-
-    function addEvent(event) {
-      if (event.system === "connected") {
-        for (const id of (event.active_calls || [])) {
-          const call = calls.get(id) || { id, events: [], active: true };
-          call.active = true;
-          calls.set(id, call);
-        }
-        renderCalls();
-        return;
-      }
-      const id = callKey(event);
-      const call = calls.get(id) || { id, events: [], active: true };
-      if (event.type === "call_ended") call.active = false;
-      else call.active = true;
-      call.events.push(event);
-      if (call.events.length > 500) call.events.shift();
-      calls.set(id, call);
-      if (!selectedCall) selectedCall = id;
-      renderCalls();
-      if (selectedCall === id) renderTranscript();
-    }
-
-    function connect() {
-      const scheme = location.protocol === "https:" ? "wss" : "ws";
-      socket = new WebSocket(`${scheme}://${location.host}/live/ws`);
-      socket.onopen = () => { statusEl.textContent = "connected"; };
-      socket.onmessage = (message) => addEvent(JSON.parse(message.data));
-      socket.onclose = () => {
-        statusEl.textContent = "reconnecting";
-        setTimeout(connect, 1500);
-      };
-      socket.onerror = () => socket.close();
-    }
-
-    clearEl.onclick = () => {
-      const call = calls.get(selectedCall);
-      if (call) call.events = [];
-      renderTranscript();
-      renderCalls();
-    };
-
-    connect();
-  </script>
-</body>
-</html>
-"""
-
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+if (STATIC_DIR / "assets").exists():
+    app.mount("/live/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="static_assets")
 
 @app.get("/live", response_class=HTMLResponse)
 async def live_dashboard():
-    return LIVE_HTML
+    index_file = STATIC_DIR / "index.html"
+    return HTMLResponse(content=index_file.read_text(encoding="utf-8"))
 
 
 @app.websocket("/live/ws")
@@ -698,3 +643,35 @@ async def freeswitch_audio(ws: WebSocket):
             _sessions.pop(session.call_id, None)
             _call_to_conversation.pop(session.call_id, None)
         log.info("[%s] FreeSWITCH stereo stream closed", base_id)
+
+
+_controller_ws: WebSocket | None = None
+
+@app.websocket("/controller/ws")
+async def controller_control_socket(ws: WebSocket):
+    global _controller_ws
+    await ws.accept()
+    _controller_ws = ws
+    log.info("ARI controller command channel connected")
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if _controller_ws is ws:
+            _controller_ws = None
+
+@app.post("/conversations/{conversation_id}/hold")
+async def hold_conversation(conversation_id: str):
+    if not _controller_ws:
+        return Response(content='{"error": "ARI controller offline"}', status_code=503, media_type="application/json")
+    await _controller_ws.send_json({"command": "hold", "conversation_id": conversation_id})
+    return {"status": "ok"}
+
+@app.post("/conversations/{conversation_id}/unhold")
+async def unhold_conversation(conversation_id: str):
+    if not _controller_ws:
+        return Response(content='{"error": "ARI controller offline"}', status_code=503, media_type="application/json")
+    await _controller_ws.send_json({"command": "unhold", "conversation_id": conversation_id})
+    return {"status": "ok"}

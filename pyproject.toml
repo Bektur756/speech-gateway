@@ -9,6 +9,8 @@ dependencies = [
     "torch>=2.4",
     "transformers>=4.44",
     "numpy>=1.26",
+    "pywebpush>=2.5.0",
+    "python-dotenv>=1.2.3",
 ]
 
 # Target server (per ТЗ) has no GPU — pull the CPU-only torch build instead
