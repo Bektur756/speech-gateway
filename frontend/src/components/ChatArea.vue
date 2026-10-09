@@ -37,14 +37,15 @@ function scrollToBottom(smooth = false) {
   })
 }
 
-// Auto-scroll when new events arrive if user isn't scrolled up
+// Auto-scroll when new merged bubbles arrive or existing ones update
 watch(
-  () => callsStore.selectedCallEvents.length,
+  () => callsStore.selectedCallMergedBubbles,
   () => {
     if (!isScrolledUp.value) {
       scrollToBottom(false)
     }
-  }
+  },
+  { deep: true }
 )
 
 // Always scroll to bottom when selecting a different call
@@ -106,6 +107,7 @@ async function handleToggleHold() {
 
       <div class="flex items-center gap-2 flex-none">
         <button
+          v-show="callsStore.isCurrentCallActive"
           type="button"
           :disabled="isHoldingLoading"
           @click="handleToggleHold"
@@ -129,11 +131,11 @@ async function handleToggleHold() {
       class="flex-1 min-h-0 overflow-y-auto theme-scrollbar p-3 sm:p-5 flex flex-col gap-3.5 overscroll-contain"
     >
       <template v-if="callsStore.selectedCall">
-        <template v-if="callsStore.selectedCallEvents.length > 0">
+        <template v-if="callsStore.selectedCallMergedBubbles.length > 0">
           <ChatBubble
-            v-for="(event, idx) in callsStore.selectedCallEvents"
-            :key="idx"
-            :event="event"
+            v-for="(bubble, idx) in callsStore.selectedCallMergedBubbles"
+            :key="`${bubble.role}-${bubble.ts}-${idx}`"
+            :event="bubble"
           />
         </template>
         <div
@@ -162,7 +164,7 @@ async function handleToggleHold() {
       leave-to-class="transform translate-y-2 opacity-0"
     >
       <button
-        v-if="isScrolledUp && callsStore.selectedCallEvents.length > 0"
+        v-if="isScrolledUp && callsStore.selectedCallMergedBubbles.length > 0"
         type="button"
         @click="scrollToBottom(true)"
         class="absolute bottom-4 right-4 sm:right-6 px-3 py-1.5 bg-slate-900/85 dark:bg-slate-100/90 text-white dark:text-slate-900 text-xs font-medium rounded-full shadow-lg backdrop-blur-sm flex items-center gap-1.5 hover:bg-slate-900 dark:hover:bg-white transition-all z-20"

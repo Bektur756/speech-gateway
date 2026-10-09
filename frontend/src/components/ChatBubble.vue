@@ -14,9 +14,11 @@ function formatTime(ts) {
 }
 
 const role = computed(() => props.event.role || 'system')
-const text = computed(() => props.event.text || props.event.partial || props.event.system || '')
+const text = computed(() => props.event.text || '')
 const engine = computed(() => props.event.engine || 'system')
-const isPartial = computed(() => Boolean(props.event.partial))
+const isPartial = computed(() => Boolean(props.event.isPartial))
+// Show the timestamp of the latest segment in the merged bubble
+const displayTs = computed(() => props.event.tsEnd || props.event.ts)
 
 const bubbleClasses = computed(() => {
   if (role.value === 'client') {
@@ -56,7 +58,7 @@ const bubbleBoxClasses = computed(() => {
         {{ role }}
       </span>
       <span class="text-[#667085] dark:text-[#9aa4b2] text-[10px] opacity-75">
-        {{ formatTime(event.ts) }}
+        {{ formatTime(displayTs) }}
       </span>
     </div>
 

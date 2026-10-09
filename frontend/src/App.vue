@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, watch } from 'vue'
+import { ref, onMounted, watch, computed } from 'vue'
 import AppHeader from './components/AppHeader.vue'
 import CallsSidebar from './components/CallsSidebar.vue'
 import ChatArea from './components/ChatArea.vue'
@@ -8,6 +8,8 @@ import { useWebSocket } from './composables/useWebSocket'
 import { usePushStore } from './stores/pushStore'
 import { useThemeStore } from './stores/themeStore'
 import { useCallsStore } from './stores/callsStore'
+import CallHeader from "./components/CallHeader.vue";
+import {useLiveAudioLevel} from "./composables/useLiveAudioLevel.js";
 
 // Initialize WebSocket connection & Pinia stores
 useWebSocket()
@@ -23,6 +25,8 @@ function handleCallSelected() {
   mobileTab.value = 'chat'
 }
 
+const selectedCallId = computed(() => callsStore.selectedCallId)
+
 // If on mobile and a call is selected initially, switch to chat
 watch(
   () => callsStore.selectedCallId,
@@ -32,7 +36,6 @@ watch(
     }
   }
 )
-
 onMounted(() => {
   themeStore.initTheme()
   pushStore.checkExistingSubscription()
@@ -47,6 +50,7 @@ onMounted(() => {
   <div class="flex flex-col h-[100dvh] overflow-hidden bg-[#f6f7f9] dark:bg-[#101317] text-[#17202a] dark:text-[#eceff3] transition-colors duration-150">
     <!-- Top Bar -->
     <AppHeader />
+    <CallHeader v-if="selectedCallId" :call-id="selectedCallId"/>
 
     <!-- Mobile view switcher tabs (visible only on screens < md) -->
     <div class="md:hidden flex-none px-3 pt-2">

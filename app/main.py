@@ -58,10 +58,13 @@ from pywebpush import webpush, WebPushException
 from .adapters import transcribe_recording
 from .audiosocket import read_frame, TYPE_UUID, TYPE_ERROR, TYPE_TERMINATE, AUDIO_SAMPLE_RATES
 from .session import CallSession
+from . import observability
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+_handler = logging.StreamHandler()
+_handler.setFormatter(observability.JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 log = logging.getLogger("main")
 
 AIRUN_API_KEY = os.environ["AIRUN_API_KEY"]
@@ -79,7 +82,7 @@ PORT_KY_OPERATOR = int(os.environ.get("AUDIOSOCKET_PORT_KY_OPERATOR", 9101))
 # see docker-compose.yml) so the container needs no internet access at
 # runtime. small = realtime-safer on CPU, medium = better accuracy.
 WHISPER_MODEL_PATH = os.environ.get("WHISPER_MODEL_PATH", "/models/kyrgyz-whisper-small")
-AUDIOSOCKET_IDLE_TIMEOUT_SECONDS = float(os.environ.get("AUDIOSOCKET_IDLE_TIMEOUT_SECONDS", "30"))
+AUDIOSOCKET_IDLE_TIMEOUT_SECONDS = float(os.environ.get("AUDIOSOCKET_IDLE_TIMEOUT_SECONDS", "60"))
 # FreeSWITCH's own audio-streaming path (see freeswitch_audio below) — a
 # stereo L16 WebSocket feed, one call per connection, split into client and
 # operator PCM here rather than carried over AudioSocket like the Asterisk
@@ -119,6 +122,18 @@ def _load_push_subscriptions() -> list[dict]:
 
 _push_subscriptions: list[dict] = _load_push_subscriptions()
 
+# call_id -> bounded queues for the live raw-audio WS. Separate from
+# _subscribers (which carries STT text events) — small maxsize so a slow
+# or absent browser subscriber never backs up onto the real-time audio
+# path; frames are dropped, not queued, when a subscriber falls behind.
+_audio_subscribers: dict[str, list[asyncio.Queue]] = {}
+
+async def broadcast_audio(call_id: str, pcm16k: bytes):
+    for q in _audio_subscribers.get(call_id, []):
+        try:
+            q.put_nowait(pcm16k)
+        except asyncio.QueueFull:
+            pass  # visualization only — dropping a frame is harmless
 
 def _save_push_subscriptions():
     PUSH_SUBSCRIPTIONS_PATH.write_text(json.dumps(_push_subscriptions, ensure_ascii=False))
@@ -273,8 +288,10 @@ async def _start_freeswitch_stereo_sessions(metadata: dict) -> tuple[str, CallSe
     client_id = f"{base_id}-client"
     operator_id = f"{base_id}-operator"
 
-    client_session = CallSession(client_id, language, ADAPTER_CONFIG, broadcast, role="client")
-    operator_session = CallSession(operator_id, language, ADAPTER_CONFIG, broadcast, role="operator")
+    client_session = CallSession(client_id, language, ADAPTER_CONFIG, broadcast, role="client",
+                                 audio_broadcaster=broadcast_audio)
+    operator_session = CallSession(operator_id, language, ADAPTER_CONFIG, broadcast, role="operator",
+                                   audio_broadcaster=broadcast_audio)
     _sessions[client_id] = client_session
     _sessions[operator_id] = operator_session
     _call_to_conversation[client_id] = base_id
@@ -294,7 +311,11 @@ def _split_stereo_l16(frame: bytes) -> tuple[bytes, bytes]:
     if len(frame) % 4:
         log.warning("FreeSWITCH stereo frame had odd byte count=%d; trimming", len(frame))
         frame = frame[:len(frame) - (len(frame) % 4)]
-    return audioop.tomono(frame, 2, 1, 0), audioop.tomono(frame, 2, 0, 1)
+    # In this FreeSWITCH loopback path, READ/left carries the caller-side
+    # playback and WRITE/right carries the browser-side direction.
+    client_pcm = audioop.tomono(frame, 2, 1, 0)
+    operator_pcm = audioop.tomono(frame, 2, 0, 1)
+    return client_pcm, operator_pcm
 
 
 _offline_whisper_lock = asyncio.Lock()
@@ -374,9 +395,12 @@ async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
             if kind == TYPE_UUID:
                 call_id = payload.hex()
-                session = CallSession(call_id, language, ADAPTER_CONFIG, broadcast, role=role)
+                session = CallSession(call_id, language, ADAPTER_CONFIG, broadcast, role=role, audio_broadcaster=broadcast_audio)
                 _sessions[call_id] = session
                 await session.start()
+                observability.inc("calls_total", labels={"language": language})
+                observability.set_gauge("active_calls", len(_sessions))
+                observability.event_log(log, "call_started", call_id=call_id, language=language, status="active")
                 # Skip the "operator" leg of a dual-leg call: the ARI
                 # controller opens the client leg (port 9100) alongside it
                 # for the same physical call, so notifying on that leg only
@@ -397,6 +421,8 @@ async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         if session is not None:
             await session.close()
             _sessions.pop(call_id, None)
+            observability.set_gauge("active_calls", len(_sessions))
+            observability.event_log(log, "call_ended", call_id=call_id, status="ended")
             conversation_id = _call_to_conversation.get(call_id)
             if _OFFLINE_WHISPER_PASSES and conversation_id and session.recording_path is not None:
                 asyncio.create_task(
@@ -441,6 +467,11 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 async def health():
     return {"status": "ok", "active_calls": list(_sessions.keys())}
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    return Response(content=observability.exposition(), media_type="text/plain; version=0.0.4")
 
 
 @app.get("/sw.js")
@@ -597,6 +628,7 @@ async def freeswitch_audio(ws: WebSocket):
     base_id = "unknown"
     client_session: CallSession | None = None
     operator_session: CallSession | None = None
+    next_stereo_diag = 0.0
 
     try:
         while True:
@@ -622,6 +654,13 @@ async def freeswitch_audio(ws: WebSocket):
                 base_id, client_session, operator_session = await _start_freeswitch_stereo_sessions(metadata)
 
             client_pcm, operator_pcm = _split_stereo_l16(frame)
+            now = time.monotonic()
+            if now >= next_stereo_diag:
+                left_pcm = audioop.tomono(frame, 2, 1, 0)
+                right_pcm = audioop.tomono(frame, 2, 0, 1)
+                log.info("RAW_STEREO_FRAME call_id=%s left_read_rms=%d right_write_rms=%d bytes=%d",
+                         base_id, audioop.rms(left_pcm, 2), audioop.rms(right_pcm, 2), len(frame))
+                next_stereo_diag = now + 1.0
             await client_session.feed(client_pcm, sample_rate=FREESWITCH_AUDIO_SAMPLE_RATE)
             await operator_session.feed(operator_pcm, sample_rate=FREESWITCH_AUDIO_SAMPLE_RATE)
 
@@ -644,6 +683,24 @@ async def freeswitch_audio(ws: WebSocket):
             _call_to_conversation.pop(session.call_id, None)
         log.info("[%s] FreeSWITCH stereo stream closed", base_id)
 
+
+@app.websocket("/calls/{call_id}/audio")
+async def stream_call_audio(ws: WebSocket, call_id: str):
+    """Raw 16kHz mono PCM16LE frames for live waveform visualization
+    only — not used for transcription, no format negotiation. Bounded
+    queue: a slow client drops frames rather than ever blocking the
+    real-time audio path upstream (see CallSession.feed)."""
+    await ws.accept()
+    q: asyncio.Queue = asyncio.Queue()
+    _audio_subscribers.setdefault(call_id, []).append(q)
+    try:
+        while True:
+            data = await q.get()
+            await ws.send_bytes(data)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _audio_subscribers[call_id].remove(q)
 
 _controller_ws: WebSocket | None = None
 

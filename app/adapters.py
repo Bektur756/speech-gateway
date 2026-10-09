@@ -92,7 +92,38 @@ class VoskAdapter(STTAdapter):
                             if "partial" in msg and msg["partial"]:
                                 await event_queue.put({"type": "partial", "text": msg["partial"]})
                             elif "text" in msg and msg["text"]:
-                                await event_queue.put({"type": "final", "text": msg["text"]})
+                                log.info("RAW_GIGAAM_RESPONSE %s", json.dumps(msg, ensure_ascii=False, sort_keys=True))
+                                normalized = {
+                                    "type": "final", "text": msg["text"],
+                                    "audio_start_timestamp": msg.get("audio_start_timestamp"),
+                                    "audio_end_timestamp": msg.get("audio_end_timestamp"),
+                                    "inference_start_timestamp": msg.get("inference_start_timestamp"),
+                                    "inference_end_timestamp": msg.get("inference_end_timestamp"),
+                                    "audio_duration_ms": msg.get("audio_duration_ms"),
+                                    "inference_latency_ms": msg.get("inference_latency_ms"),
+                                    "pipeline_latency_ms": msg.get("pipeline_latency_ms"),
+                                    "rtf": msg.get("rtf"),
+                                    "speech_end_timestamp": msg.get("speech_end_timestamp"),
+                                    "segment_flush_timestamp": msg.get("segment_flush_timestamp"),
+                                    "speech_duration_ms": msg.get("speech_duration_ms"),
+                                    "silence_duration_ms": msg.get("silence_duration_ms"),
+                                    "endpoint_delay_ms": msg.get("endpoint_delay_ms"),
+                                    "speech_end_to_transcript_ms": msg.get("speech_end_to_transcript_ms"),
+                                    "flush_reason": msg.get("flush_reason"),
+                                    "rms_min": msg.get("rms_min"), "rms_max": msg.get("rms_max"),
+                                    "rms_mean": msg.get("rms_mean"), "rms_p50": msg.get("rms_p50"),
+                                    "rms_p95": msg.get("rms_p95"),
+                                    "speech_frame_count": msg.get("speech_frame_count"),
+                                    "silence_frame_count": msg.get("silence_frame_count"),
+                                    "speech_ratio": msg.get("speech_ratio"),
+                                    "active_stt_jobs_at_start": msg.get("active_stt_jobs_at_start"),
+                                    "active_stt_jobs_at_end": msg.get("active_stt_jobs_at_end"),
+                                    "process_cpu_percent": msg.get("process_cpu_percent"),
+                                    "system_cpu_percent": msg.get("system_cpu_percent"),
+                                    "system_load": msg.get("system_load"),
+                                }
+                                log.info("ADAPTER_NORMALIZED_EVENT %s", json.dumps(normalized, ensure_ascii=False, sort_keys=True))
+                                await event_queue.put(normalized)
 
                     if eof_sent:
                         # Audio side already finished before the drop — this

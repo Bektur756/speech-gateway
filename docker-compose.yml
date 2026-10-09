@@ -48,6 +48,62 @@ services:
     # this CPU-only box, no GPU needed to start).
     build: ./gigaam-server
     restart: unless-stopped
+    environment:
+      # MVP default: endpoint speech after 700ms silence, capped at 5s.
+      # Emergency rollback: set GIGAAM_SEGMENTATION_MODE=fixed and
+      # GIGAAM_CHUNK_SECONDS=15 in the environment before `up -d gigaam`.
+      GIGAAM_SEGMENTATION_MODE: ${GIGAAM_SEGMENTATION_MODE:-vad}
+      GIGAAM_CHUNK_SECONDS: ${GIGAAM_CHUNK_SECONDS:-15}
+      GIGAAM_VAD_SILENCE_MS: ${GIGAAM_VAD_SILENCE_MS:-500}
+      GIGAAM_VAD_MIN_SEGMENT_SECONDS: ${GIGAAM_VAD_MIN_SEGMENT_SECONDS:-1.0}
+      GIGAAM_VAD_MAX_SEGMENT_SECONDS: ${GIGAAM_VAD_MAX_SEGMENT_SECONDS:-5}
+      # GIGAAM_VAD_RMS_THRESHOLD (default: 400)
+      #
+      # What it does:
+      #   Per-audio-frame energy gate for the naive amplitude-based VAD in
+      #   asr_server.py. For every incoming 16-bit PCM frame, its RMS
+      #   (root-mean-square amplitude, range 0-32767 for 16-bit audio) is
+      #   compared against this value: rms >= threshold => "voiced", otherwise
+      #   "silence". This single boolean per frame drives everything else in
+      #   VAD mode — speech_frame_count/silence_frame_count, when a segment is
+      #   allowed to end early via "vad_silence" (accumulated silence_ms >=
+      #   GIGAAM_VAD_SILENCE_MS after seeing speech), and whether a segment
+      #   even starts accumulating toward GIGAAM_VAD_MIN_SEGMENT_SECONDS at all.
+      #   It is purely amplitude-based — no spectral/ML voice detection — so it
+      #   cannot distinguish speech from any other loud sound (line noise
+      #   bursts, dial tones, static, background media).
+      #
+      # Too LOW (raise it if you see this):
+      #   Background noise / line hum / crosstalk gets classified as "voiced",
+      #   so vad_silence_ms never accumulates and segments almost never end via
+      #   natural pause detection — they only ever hit
+      #   GIGAAM_VAD_MAX_SEGMENT_SECONDS ("max_duration"). Symptom: check the
+      #   "flush_reason" field on emitted final events — if it's overwhelmingly
+      #   "max_duration" instead of "vad_silence" even during calls with clear
+      #   pauses, the threshold is too low relative to the noise floor. Effect
+      #   is functionally the same as running in fixed-chunk mode: segments get
+      #   cut on a timer, not on sentence/phrase boundaries.
+      #
+      # Too HIGH (lower it if you see this):
+      #   Quiet or distant-mic speech never crosses the threshold, so it's
+      #   classified as silence: vad_seen_speech never flips true, speech
+      #   frames aren't counted, and short quiet utterances can fail to reach
+      #   GIGAAM_VAD_MIN_SEGMENT_SECONDS before the buffer is force-flushed by
+      #   max_duration — i.e. speech gets dropped or truncated instead of
+      #   properly segmented. Symptom: "speech_ratio" and "speech_frame_count"
+      #   in emitted events stay near zero despite audible speech in the call,
+      #   and VAD_SPEECH_STARTED never logs for that caller/leg.
+      #
+      # How to tune:
+      #   Each final event already carries rms_min/rms_max/rms_mean/rms_p50/
+      #   rms_p95 for its segment. Pull a few real recordings from this
+      #   deployment, note the typical RMS during known-silence stretches vs.
+      #   known-speech stretches (rms_p50 is a good single number to compare),
+      #   and set the threshold roughly between the two populations. Telephony
+      #   gain varies by carrier/trunk/codec, so this is not safely portable
+      #   across deployments without a quick check — recalibrate per trunk if
+      #   you add a new one with noticeably different line levels.
+      GIGAAM_VAD_RMS_THRESHOLD: ${GIGAAM_VAD_RMS_THRESHOLD:-400}
     volumes:
       # ~800MB model download persisted here so it survives container
       # recreation instead of re-fetching from Hugging Face every time.
@@ -121,4 +177,3 @@ services:
       - "5173:5173"
     command: sh -c "npm install && npm run dev"
     profiles: ["dev"]
-
